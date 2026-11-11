@@ -35,7 +35,7 @@ static int probe_entry(struct kmem_cache *cachep)
 		valuep = bpf_map_lookup_elem(&slab_entries, &name);
 		if (!valuep)
 			return 0;
-		bpf_probe_read_kernel(&valuep->name, sizeof(valuep->name), name);
+		bpf_probe_read_kernel_str(&valuep->name, sizeof(valuep->name), name);
 	}
 
 	valuep->count++;
@@ -48,6 +48,12 @@ SEC("kprobe/kmem_cache_alloc")
 int BPF_KPROBE(kmem_cache_alloc, struct kmem_cache *cachep)
 {
 	return probe_entry(cachep);
+}
+
+SEC("kprobe/kmem_cache_alloc_noprof")
+int BPF_KPROBE(kmem_cache_alloc_noprof, struct kmem_cache *cachep)
+{
+       return probe_entry(cachep);
 }
 
 char LICENSE[] SEC("license") = "Dual BSD/GPL";

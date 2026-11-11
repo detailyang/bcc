@@ -172,9 +172,14 @@ static int trace_entry(struct pt_regs *ctx, int id)
 #else
         page_offset = __PAGE_OFFSET_BASE_L4;
 #endif
+#elif defined(__identity_base)
+        // s390 6.10 and later PAGE_OFFSET is not a constant and need
+        // to be read from the kernel address space
+        bpf_probe_read_kernel(&page_offset, sizeof(PAGE_OFFSET), &PAGE_OFFSET);
 #else
         // earlier x86_64 kernels, e.g., 4.6, comes here
-        // arm64, s390, powerpc, x86_32
+        // s390 before 6.10
+        // arm64, powerpc, x86_32
         page_offset = PAGE_OFFSET;
 #endif
 
@@ -317,17 +322,17 @@ def print_stack(event):
         # print folded stack output
         user_stack = list(user_stack)
         kernel_stack = list(kernel_stack)
-        line = [event.comm.decode('utf-8', 'replace')] + \
+        line = [event.comm] + \
             [b.sym(addr, event.tgid_pid) for addr in reversed(user_stack)] + \
             (do_delimiter and ["-"] or []) + \
             [b.ksym(addr) for addr in reversed(kernel_stack)]
-        print("%s %d" % (";".join(line), 1))
+        print("%s %d" % (b';'.join(line).decode('utf-8', 'replace'), 1))
     else:
         # print default multi-line stack output.
         for addr in kernel_stack:
-            print("    %s" % b.ksym(addr))
+            print("    %s" % b.ksym(addr).decode('utf-8', 'replace'))
         for addr in user_stack:
-            print("    %s" % b.sym(addr, event.tgid_pid))
+            print("    %s" % b.sym(addr, event.tgid_pid).decode('utf-8', 'replace'))
 
 def print_event(cpu, data, size):
     event = b["events"].event(data)

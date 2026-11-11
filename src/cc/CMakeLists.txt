@@ -44,9 +44,6 @@ if (NOT HAVE_REALLOCARRAY_SUPPORT)
   set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -DCOMPAT_NEED_REALLOCARRAY")
 endif()
 
-string(REGEX MATCH "^([0-9]+).*" _ ${LLVM_PACKAGE_VERSION})
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DLLVM_MAJOR_VERSION=${CMAKE_MATCH_1}")
-
 include(static_libstdc++)
 
 if(LIBBPF_INCLUDE_DIR)
@@ -82,7 +79,7 @@ endif()
 
 set(bcc_table_sources table_storage.cc shared_table.cc bpffs_table.cc json_map_decl_visitor.cc)
 set(bcc_util_sources common.cc)
-set(bcc_sym_sources bcc_syms.cc bcc_elf.c bcc_perf_map.c bcc_proc.c)
+set(bcc_sym_sources bcc_syms.cc bcc_elf.c bcc_perf_map.c bcc_proc.c bcc_zip.c)
 set(bcc_common_headers libbpf.h perf_reader.h "${CMAKE_CURRENT_BINARY_DIR}/bcc_version.h")
 set(bcc_table_headers file_desc.h table_desc.h table_storage.h)
 set(bcc_api_headers bcc_common.h bpf_module.h bcc_exception.h bcc_syms.h bcc_proc.h bcc_elf.h)
@@ -160,7 +157,7 @@ endif()
 
 if(ENABLE_CPP_API)
   add_subdirectory(api)
-  list(APPEND bcc_common_libs_for_a api-static)
+  target_sources(bcc-static PRIVATE $<TARGET_OBJECTS:api-objects>)
   # Keep all API functions
   list(APPEND bcc_common_libs_for_s -Wl,--whole-archive api-static -Wl,--no-whole-archive)
 endif()
@@ -174,6 +171,8 @@ if(ENABLE_USDT)
 endif()
 
 add_subdirectory(frontends)
+
+target_sources(bcc-static PRIVATE $<TARGET_OBJECTS:clang_frontend-objects>)
 
 # Link against LLVM libraries
 target_link_libraries(bcc-shared ${bcc_common_libs_for_s})

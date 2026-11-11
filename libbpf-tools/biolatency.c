@@ -12,6 +12,7 @@
 #include <bpf/libbpf.h>
 #include <sys/resource.h>
 #include <bpf/bpf.h>
+#include <bpf/btf.h>
 #include "blk_types.h"
 #include "biolatency.h"
 #include "biolatency.skel.h"
@@ -57,15 +58,15 @@ const char argp_program_doc[] =
 "    biolatency -c CG        # Trace process under cgroupsPath CG\n";
 
 static const struct argp_option opts[] = {
-	{ "timestamp", 'T', NULL, 0, "Include timestamp on output" },
-	{ "milliseconds", 'm', NULL, 0, "Millisecond histogram" },
-	{ "queued", 'Q', NULL, 0, "Include OS queued time in I/O time" },
-	{ "disk", 'D', NULL, 0, "Print a histogram per disk device" },
-	{ "flag", 'F', NULL, 0, "Print a histogram per set of I/O flags" },
-	{ "disk",  'd', "DISK",  0, "Trace this disk only" },
-	{ "verbose", 'v', NULL, 0, "Verbose debug output" },
-	{ "cgroup", 'c', "/sys/fs/cgroup/unified", 0, "Trace process in cgroup path"},
-	{ NULL, 'h', NULL, OPTION_HIDDEN, "Show the full help" },
+	{ "timestamp", 'T', NULL, 0, "Include timestamp on output", 0 },
+	{ "milliseconds", 'm', NULL, 0, "Millisecond histogram", 0 },
+	{ "queued", 'Q', NULL, 0, "Include OS queued time in I/O time", 0 },
+	{ "disk", 'D', NULL, 0, "Print a histogram per disk device", 0 },
+	{ "flag", 'F', NULL, 0, "Print a histogram per set of I/O flags", 0 },
+	{ "disk",  'd', "DISK",  0, "Trace this disk only", 0 },
+	{ "verbose", 'v', NULL, 0, "Verbose debug output", 0 },
+	{ "cgroup", 'c', "/sys/fs/cgroup/unified", 0, "Trace process in cgroup path", 0 },
+	{ NULL, 'h', NULL, OPTION_HIDDEN, "Show the full help", 0 },
 	{},
 };
 
@@ -233,6 +234,39 @@ static int print_log2_hists(struct bpf_map *hists, struct partitions *partitions
 	return 0;
 }
 
+/*
+ * BTF has a func proto for each tracepoint, let's check it like
+ *   typedef void (*btf_trace_block_rq_issue)(void *, struct request *);
+ *
+ * Actually it's a typedef for a pointer to the func proto.
+ */
+static bool has_block_rq_issue_single_arg(void)
+{
+	const struct btf *btf = btf__load_vmlinux_btf();
+	const struct btf_type *t1, *t2, *t3;
+	__u32 type_id;
+	bool ret = true;  // assuming recent kernels
+
+	type_id = btf__find_by_name_kind(btf, "btf_trace_block_rq_issue",
+					 BTF_KIND_TYPEDEF);
+	if ((__s32)type_id < 0)
+		return ret;
+
+	t1 = btf__type_by_id(btf, type_id);
+	if (t1 == NULL)
+		return ret;
+
+	t2 = btf__type_by_id(btf, t1->type);
+	if (t2 == NULL || !btf_is_ptr(t2))
+		return ret;
+
+	t3 = btf__type_by_id(btf, t2->type);
+	if (t3 && btf_is_func_proto(t3))
+		ret = (btf_vlen(t3) == 2); // ctx + arg
+
+	return ret;
+}
+
 int main(int argc, char **argv)
 {
 	struct partitions *partitions = NULL;
@@ -243,9 +277,7 @@ int main(int argc, char **argv)
 		.doc = argp_program_doc,
 	};
 	struct biolatency_bpf *obj;
-	struct tm *tm;
 	char ts[32];
-	time_t t;
 	int err;
 	int idx, cg_map_fd;
 	int cgfd = -1;
@@ -254,7 +286,6 @@ int main(int argc, char **argv)
 	if (err)
 		return err;
 
-	libbpf_set_strict_mode(LIBBPF_STRICT_ALL);
 	libbpf_set_print(libbpf_print_fn);
 
 	obj = biolatency_bpf__open();
@@ -284,6 +315,7 @@ int main(int argc, char **argv)
 	obj->rodata->targ_ms = env.milliseconds;
 	obj->rodata->targ_queued = env.queued;
 	obj->rodata->filter_cg = env.cg;
+	obj->rodata->targ_single = has_block_rq_issue_single_arg();
 
 	if (probe_tp_btf("block_rq_insert")) {
 		bpf_program__set_autoload(obj->progs.block_rq_insert, false);
@@ -336,9 +368,7 @@ int main(int argc, char **argv)
 		printf("\n");
 
 		if (env.timestamp) {
-			time(&t);
-			tm = localtime(&t);
-			strftime(ts, sizeof(ts), "%H:%M:%S", tm);
+			str_timestamp("%H:%M:%S", ts, sizeof(ts));
 			printf("%-8s\n", ts);
 		}
 

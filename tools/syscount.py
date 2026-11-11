@@ -11,14 +11,17 @@
 # 15-Feb-2017   Sasha Goldshtein    Created this.
 # 16-May-2022   Rocky Xing          Added TID filter support.
 # 26-Jul-2022   Rocky Xing          Added syscall filter support.
+# 12-Jul-2025   Rocky Xing          Execute a program and trace it's syscalls.
 
 from time import sleep, strftime
 import argparse
 import errno
 import itertools
+import os
 import sys
 import signal
 from bcc import BPF
+from bcc.exec import run_cmd, cmd_ready, cmd_exited
 from bcc.utils import printb
 from bcc.syscall import syscall_name, syscalls
 
@@ -49,6 +52,8 @@ parser.add_argument("-p", "--pid", type=int,
     help="trace only this pid")
 parser.add_argument("-t", "--tid", type=int,
     help="trace only this tid")
+parser.add_argument("-c", "--ppid", type=int,
+    help="trace only child of this pid")
 parser.add_argument("-i", "--interval", type=int,
     help="print summary at this interval (seconds)")
 parser.add_argument("-d", "--duration", type=int,
@@ -71,11 +76,22 @@ parser.add_argument("--syscall", type=str,
     help="trace this syscall only (use option -l to get all recognized syscalls)")
 parser.add_argument("--ebpf", action="store_true",
     help=argparse.SUPPRESS)
+parser.add_argument('--exec', nargs=argparse.REMAINDER,
+    help="execute command (as the last parameter, "
+        "supports multiple parameters, for example: --exec ls -l /tmp")
 args = parser.parse_args()
 if args.duration and not args.interval:
     args.interval = args.duration
 if not args.interval:
     args.interval = 99999999
+
+if args.pid and args.exec:
+    print("ERROR: can only use -p or --exec. Exiting.")
+    exit(1)
+
+if args.exec is not None and len(args.exec) == 0:
+    print("ERROR: --exec without command. Exiting.")
+    exit(1)
 
 syscall_nr = -1
 if args.syscall is not None:
@@ -94,6 +110,8 @@ if args.list:
     sys.exit(0)
 
 text = """
+#include <linux/sched.h>
+
 #ifdef LATENCY
 struct data_t {
     u64 count;
@@ -127,6 +145,13 @@ TRACEPOINT_PROBE(raw_syscalls, sys_enter) {
         return 0;
 #endif
 
+#ifdef FILTER_PPID
+    struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+    u32 ppid = task->real_parent->tgid;
+    if (ppid != FILTER_PPID)
+        return 0;
+#endif
+
     u64 t = bpf_ktime_get_ns();
     start.update(&pid_tgid, &t);
     return 0;
@@ -150,6 +175,13 @@ TRACEPOINT_PROBE(raw_syscalls, sys_exit) {
 
 #ifdef FILTER_TID
     if (tid != FILTER_TID)
+        return 0;
+#endif
+
+#ifdef FILTER_PPID
+    struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+    u32 ppid = task->real_parent->tgid;
+    if (ppid != FILTER_PPID)
         return 0;
 #endif
 
@@ -193,8 +225,12 @@ TRACEPOINT_PROBE(raw_syscalls, sys_exit) {
 
 if args.pid:
     text = ("#define FILTER_PID %d\n" % args.pid) + text
+elif args.exec:
+    text = ("#define FILTER_PID %d\n" % run_cmd(args.exec)) + text
 elif args.tid:
     text = ("#define FILTER_TID %d\n" % args.tid) + text
+elif args.ppid:
+    text = ("#define FILTER_PPID %d\n" % args.ppid) + text
 if args.failures:
     text = "#define FILTER_FAILED\n" + text
 if args.errno:
@@ -210,6 +246,9 @@ if args.ebpf:
     exit()
 
 bpf = BPF(text=text)
+
+if args.exec:
+   cmd_ready()
 
 def print_stats():
     if args.latency:
@@ -232,22 +271,30 @@ def agg_colval(key):
     else:
         return syscall_name(key.value)
 
+# check whether hash table batch ops is supported
+htab_batch_ops = True if BPF.kernel_struct_has_field(b'bpf_map_ops',
+        b'map_lookup_and_delete_batch') == 1 else False
+
 def print_count_stats():
     data = bpf["data"]
     print("[%s]" % strftime("%H:%M:%S"))
     print("%-22s %8s" % (agg_colname, "COUNT"))
-    for k, v in sorted(data.items(), key=lambda kv: -kv[1].value)[:args.top]:
+    for k, v in sorted(data.items_lookup_and_delete_batch()
+                       if htab_batch_ops else data.items(),
+                       key=lambda kv: -kv[1].value)[:args.top]:
         if k.value == 0xFFFFFFFF:
             continue    # happens occasionally, we don't need it
         printb(b"%-22s %8d" % (agg_colval(k), v.value))
     print("")
-    data.clear()
+    if not htab_batch_ops:
+        data.clear()
 
 def print_latency_stats():
     data = bpf["data"]
     print("[%s]" % strftime("%H:%M:%S"))
     print("%-22s %8s %16s" % (agg_colname, "COUNT", time_colname))
-    for k, v in sorted(data.items(),
+    for k, v in sorted(data.items_lookup_and_delete_batch()
+                       if htab_batch_ops else data.items(),
                        key=lambda kv: -kv[1].total_ns)[:args.top]:
         if k.value == 0xFFFFFFFF:
             continue    # happens occasionally, we don't need it
@@ -255,7 +302,8 @@ def print_latency_stats():
                (agg_colval(k), v.count,
                 v.total_ns / (1e6 if args.milliseconds else 1e3)))
     print("")
-    data.clear()
+    if not htab_batch_ops:
+        data.clear()
 
 if args.syscall is not None:
     print("Tracing %ssyscall '%s'... Ctrl+C to quit." %
@@ -273,6 +321,8 @@ while True:
         exiting = 1
         signal.signal(signal.SIGINT, signal_ignore)
     if args.duration and seconds >= args.duration:
+        exiting = 1
+    if args.exec and cmd_exited():
         exiting = 1
 
     print_stats()

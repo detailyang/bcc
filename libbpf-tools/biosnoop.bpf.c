@@ -13,6 +13,7 @@ const volatile bool filter_cg = false;
 const volatile bool targ_queued = false;
 const volatile bool filter_dev = false;
 const volatile __u32 targ_dev = 0;
+const volatile __u64 min_ns = 0;
 
 extern __u32 LINUX_KERNEL_VERSION __kconfig;
 
@@ -61,13 +62,22 @@ int trace_pid(struct request *rq)
 	struct piddata piddata = {};
 
 	piddata.pid = id >> 32;
-	bpf_get_current_comm(&piddata.comm, sizeof(&piddata.comm));
+	bpf_get_current_comm(&piddata.comm, sizeof(piddata.comm));
 	bpf_map_update_elem(&infobyreq, &rq, &piddata, 0);
 	return 0;
 }
 
 SEC("fentry/blk_account_io_start")
 int BPF_PROG(blk_account_io_start, struct request *rq)
+{
+	if (filter_cg && !bpf_current_task_under_cgroup(&cgroup_map, 0))
+		return 0;
+
+	return trace_pid(rq);
+}
+
+SEC("tp_btf/block_io_start")
+int BPF_PROG(block_io_start, struct request *rq)
 {
 	if (filter_cg && !bpf_current_task_under_cgroup(&cgroup_map, 0))
 		return 0;
@@ -116,11 +126,14 @@ int BPF_PROG(block_rq_insert)
 		return 0;
 
 	/**
-	 * commit a54895fa (v5.11-rc1) changed tracepoint argument list
+	 * commit a54895fa (block: remove the request_queue to argument
+	 * request based tracepoints) changed tracepoint argument list
 	 * from TP_PROTO(struct request_queue *q, struct request *rq)
 	 * to TP_PROTO(struct request *rq)
+	 * see:
+	 *     https://github.com/torvalds/linux/commit/a54895fa
 	 */
-	if (LINUX_KERNEL_VERSION >= KERNEL_VERSION(5, 11, 0))
+	if (LINUX_KERNEL_VERSION >= KERNEL_VERSION(5, 10, 137))
 		return trace_rq_start((void *)ctx[0], true);
 	else
 		return trace_rq_start((void *)ctx[1], true);
@@ -133,11 +146,14 @@ int BPF_PROG(block_rq_issue)
 		return 0;
 
 	/**
-	 * commit a54895fa (v5.11-rc1) changed tracepoint argument list
+	 * commit a54895fa (block: remove the request_queue to argument
+	 * request based tracepoints) changed tracepoint argument list
 	 * from TP_PROTO(struct request_queue *q, struct request *rq)
 	 * to TP_PROTO(struct request *rq)
+	 * see:
+	 *     https://github.com/torvalds/linux/commit/a54895fa
 	 */
-	if (LINUX_KERNEL_VERSION >= KERNEL_VERSION(5, 11, 0))
+	if (LINUX_KERNEL_VERSION >= KERNEL_VERSION(5, 10, 137))
 		return trace_rq_start((void *)ctx[0], false);
 	else
 		return trace_rq_start((void *)ctx[1], false);
@@ -160,7 +176,7 @@ int BPF_PROG(block_rq_complete, struct request *rq, int error,
 	if (!stagep)
 		return 0;
 	delta = (s64)(ts - stagep->issue);
-	if (delta < 0)
+	if (delta < 0 || delta < min_ns)
 		goto cleanup;
 	piddatap = bpf_map_lookup_elem(&infobyreq, &rq);
 	if (!piddatap) {
@@ -178,9 +194,9 @@ int BPF_PROG(block_rq_complete, struct request *rq, int error,
 			event.qdelta = stagep->issue - stagep->insert;
 	}
 	event.ts = ts;
-	event.sector = rq->__sector;
-	event.len = rq->__data_len;
-	event.cmd_flags = rq->cmd_flags;
+	event.sector = BPF_CORE_READ(rq, __sector);
+	event.len = BPF_CORE_READ(rq, __data_len);
+	event.cmd_flags = BPF_CORE_READ(rq, cmd_flags);
 	event.dev = stagep->dev;
 	bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &event,
 			sizeof(event));

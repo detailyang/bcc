@@ -29,6 +29,7 @@ struct env {
 	bool per_cpu;
 	bool runqocc;
 	bool timestamp;
+	bool host;
 	time_t interval;
 	int freq;
 	int times;
@@ -55,15 +56,17 @@ const char argp_program_doc[] =
 "    runqlen -T 1    # 1s summaries and timestamps\n"
 "    runqlen -O      # report run queue occupancy\n"
 "    runqlen -C      # show each CPU separately\n"
+"    runqlen -H      # show nr_running from host's rq instead of cfs_rq\n"
 "    runqlen -f 199  # sample at 199HZ\n";
 
 static const struct argp_option opts[] = {
-	{ "cpus", 'C', NULL, 0, "Print output for each CPU separately" },
-	{ "frequency", 'f', "FREQUENCY", 0, "Sample with a certain frequency" },
-	{ "runqocc", 'O', NULL, 0, "Report run queue occupancy" },
-	{ "timestamp", 'T', NULL, 0, "Include timestamp on output" },
-	{ "verbose", 'v', NULL, 0, "Verbose debug output" },
-	{ NULL, 'h', NULL, OPTION_HIDDEN, "Show the full help" },
+	{ "cpus", 'C', NULL, 0, "Print output for each CPU separately", 0 },
+	{ "frequency", 'f', "FREQUENCY", 0, "Sample with a certain frequency", 0 },
+	{ "runqocc", 'O', NULL, 0, "Report run queue occupancy", 0 },
+	{ "timestamp", 'T', NULL, 0, "Include timestamp on output", 0 },
+	{ "verbose", 'v', NULL, 0, "Verbose debug output", 0 },
+	{ "host", 'H', NULL, 0, "Report nr_running from host's rq", 0 },
+	{ NULL, 'h', NULL, OPTION_HIDDEN, "Show the full help", 0 },
 	{},
 };
 
@@ -86,6 +89,9 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 		break;
 	case 'T':
 		env.timestamp = true;
+		break;
+	case 'H':
+		env.host = true;
 		break;
 	case 'f':
 		errno = 0;
@@ -190,7 +196,7 @@ static void print_runq_occupancy(struct runqlen_bpf__bss *bss)
 				queued += val;
 		}
 		samples = idle + queued;
-		runqocc = queued * 1.0 / max(1ULL, samples);
+		runqocc = queued * 1.0 / max(1ULL, (unsigned long long)samples);
 		if (env.per_cpu)
 			printf("runqocc, CPU %-3d %6.2f%%\n", i,
 				100 * runqocc);
@@ -223,16 +229,13 @@ int main(int argc, char **argv)
 	};
 	struct bpf_link *links[MAX_CPU_NR] = {};
 	struct runqlen_bpf *obj;
-	struct tm *tm;
 	char ts[32];
 	int err, i;
-	time_t t;
 
 	err = argp_parse(&argp, argc, argv, 0, NULL, NULL);
 	if (err)
 		return err;
 
-	libbpf_set_strict_mode(LIBBPF_STRICT_ALL);
 	libbpf_set_print(libbpf_print_fn);
 
 	nr_cpus = libbpf_num_possible_cpus();
@@ -261,6 +264,7 @@ int main(int argc, char **argv)
 
 	/* initialize global data (filtering options) */
 	obj->rodata->targ_per_cpu = env.per_cpu;
+	obj->rodata->targ_host = env.host;
 
 	err = runqlen_bpf__load(obj);
 	if (err) {
@@ -286,9 +290,7 @@ int main(int argc, char **argv)
 		printf("\n");
 
 		if (env.timestamp) {
-			time(&t);
-			tm = localtime(&t);
-			strftime(ts, sizeof(ts), "%H:%M:%S", tm);
+			str_timestamp("%H:%M:%S", ts, sizeof(ts));
 			printf("%-8s\n", ts);
 		}
 

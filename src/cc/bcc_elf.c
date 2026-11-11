@@ -35,6 +35,7 @@
 #include "bcc_elf.h"
 #include "bcc_proc.h"
 #include "bcc_syms.h"
+#include "bcc_zip.h"
 
 #define NT_STAPSDT 3
 #define ELF_ST_TYPE(x) (((uint32_t) x) & 0xf)
@@ -50,7 +51,6 @@ static int openelf_fd(int fd, Elf **elf_out) {
   return 0;
 }
 
-#ifdef HAVE_LIBLZMA
 static int openelf_mem(void *buf, size_t buf_len, Elf **elf_out) {
   if (elf_version(EV_CURRENT) == EV_NONE)
     return -1;
@@ -61,29 +61,50 @@ static int openelf_mem(void *buf, size_t buf_len, Elf **elf_out) {
 
   return 0;
 }
-#endif
+
+// Type of bcc_elf_file.
+enum bcc_elf_file_type {
+  // Empty bcc_elf_file, not associated with any Elf or resources.
+  // None of the union fields should be read and elf pointer is NULL.
+  BCC_ELF_FILE_TYPE_NONE = 0,
+
+  // bcc_elf_file owning a file descriptor and providing access to
+  // an Elf file backed by data from that file.
+  // fd field of the impl union stores the file descriptor and elf
+  // pointer is not NULL.
+  BCC_ELF_FILE_TYPE_FD,
+
+  // bcc_elf_file owning a memory buffer and providing access to an
+  // Elf file backed by data in that buffer.
+  // buf field of the impl union stores the address of the buffer
+  // and elf pointer is not NULL.
+  BCC_ELF_FILE_TYPE_BUF,
+
+  // bcc_elf_file owning a bcc_zip_archive and providing access to
+  // an Elf file backed by data from one of the zip entries.
+  // archive field of the impl union stores the address of the
+  // zip archive and elf pointer is not NULL.
+  BCC_ELF_FILE_TYPE_ARCHIVE
+};
 
 // Provides access to an Elf structure in an uniform way,
-// independently from its source (file or memory buffer).
+// independently from its source (file, memory buffer, zip archive).
 struct bcc_elf_file {
   Elf *elf;
+  enum bcc_elf_file_type type;
 
-  // Set only when the elf file is parsed from an opened file descriptor that
-  // needs to be closed. Otherwise set to -1.
-  int fd;
-
-  // Set only when the elf file is parsed from a memory buffer that needs to be
-  // freed.
-  void *buf;
+  union {
+    int fd;
+    void *buf;
+    struct bcc_zip_archive *archive;
+  };
 };
 
 // Initializes bcc_elf_file as not pointing to any elf file and not
 // owning any resources. After returning the provided elf_file can be
 // safely passed to bcc_elf_file_close.
 static void bcc_elf_file_init(struct bcc_elf_file *elf_file) {
-  elf_file->elf = NULL;
-  elf_file->fd = -1;
-  elf_file->buf = NULL;
+  memset(elf_file, 0, sizeof(struct bcc_elf_file));
 }
 
 #ifdef HAVE_LIBLZMA
@@ -96,6 +117,7 @@ static int bcc_elf_file_open_buf(void *buf, size_t buf_len,
   }
 
   out->elf = elf;
+  out->type = BCC_ELF_FILE_TYPE_BUF;
   out->buf = buf;
   return 0;
 }
@@ -109,23 +131,40 @@ static int bcc_elf_file_open_fd(int fd, struct bcc_elf_file *out) {
   }
 
   out->elf = elf;
+  out->type = BCC_ELF_FILE_TYPE_FD;
   out->fd = fd;
   return 0;
 }
 
 static int bcc_elf_file_open(const char *path, struct bcc_elf_file *out) {
+  struct bcc_zip_archive *archive = NULL;
+  struct bcc_zip_entry entry;
   int fd = -1;
 
   fd = open(path, O_RDONLY);
-  if (fd < 0)
-    return -1;
+  if (fd >= 0) {
+    if (bcc_elf_file_open_fd(fd, out)) {
+      close(fd);
+      return -1;
+    }
 
-  if (bcc_elf_file_open_fd(fd, out)) {
-    close(fd);
-    return -1;
+    return 0;
   }
 
-  return 0;
+  archive = bcc_zip_archive_open_and_find(path, &entry);
+  if (archive) {
+    if (entry.compression ||
+        openelf_mem((void *)entry.data, entry.data_length, &out->elf)) {
+      bcc_zip_archive_close(archive);
+      return -1;
+    }
+
+    out->type = BCC_ELF_FILE_TYPE_ARCHIVE;
+    out->archive = archive;
+    return 0;
+  }
+
+  return -1;
 }
 
 static void bcc_elf_file_close(struct bcc_elf_file *elf_file) {
@@ -133,12 +172,21 @@ static void bcc_elf_file_close(struct bcc_elf_file *elf_file) {
     elf_end(elf_file->elf);
   }
 
-  if (elf_file->fd >= 0) {
+  switch (elf_file->type) {
+  case BCC_ELF_FILE_TYPE_FD:
     close(elf_file->fd);
-  }
+    break;
 
-  if (elf_file->buf) {
+  case BCC_ELF_FILE_TYPE_BUF:
     free(elf_file->buf);
+    break;
+
+  case BCC_ELF_FILE_TYPE_ARCHIVE:
+    bcc_zip_archive_close(elf_file->archive);
+    break;
+
+  default:
+    break;
   }
 
   bcc_elf_file_init(elf_file);
@@ -965,12 +1013,52 @@ int bcc_elf_get_type(const char *path) {
     return hdr.e_type;
 }
 
+int bcc_elf_is_pie(const char *path) {
+  int i, j, res;
+  struct bcc_elf_file elf_file;
+
+  if (bcc_elf_file_open(path, &elf_file) < 0)
+    return false;
+
+  Elf *elf = elf_file.elf;
+  size_t shdrnum;
+
+  elf_getshdrnum(elf, &shdrnum);
+  res = false;
+
+  for (i = 0; i < shdrnum; i++) {
+    Elf_Scn *scn = elf_getscn(elf, i);
+    Elf64_Shdr *shdr = elf64_getshdr(scn);
+    Elf_Data *data = elf_getdata(scn, NULL);
+
+    if (shdr->sh_type != SHT_DYNAMIC)
+      continue;
+
+    Elf64_Dyn *dyns = data->d_buf;
+    for (j = 0; j * shdr->sh_entsize < shdr->sh_size; j++) {
+      Elf64_Dyn *dyn = &dyns[j];
+      if (dyn->d_tag == DT_FLAGS_1) {
+        if (dyn->d_un.d_val & DF_1_PIE) {
+          res = true;
+          goto done;
+        }
+      }
+    }
+  }
+
+done:
+  bcc_elf_file_close(&elf_file);
+  return res;
+}
+
 int bcc_elf_is_exe(const char *path) {
   return (bcc_elf_get_type(path) != -1) && (access(path, X_OK) == 0);
 }
 
 int bcc_elf_is_shared_obj(const char *path) {
-  return bcc_elf_get_type(path) == ET_DYN;
+  int is_dyn = bcc_elf_get_type(path) == ET_DYN;
+  int is_pie = bcc_elf_is_pie(path);
+  return is_dyn ? (is_pie ? false : true) : false;
 }
 
 int bcc_elf_is_vdso(const char *name) {

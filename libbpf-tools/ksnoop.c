@@ -315,8 +315,6 @@ static int trace_to_value(struct btf *btf, struct func *func, char *argname,
 		strncpy(val->name, argname, sizeof(val->name));
 
 	for (i = 0; i < MAX_TRACES; i++) {
-		if (!func->args[i].name)
-			continue;
 		if (strcmp(argname, func->args[i].name) != 0)
 			continue;
 		p_debug("setting base arg for val %s to %d", val->name, i);
@@ -426,8 +424,6 @@ static char *type_id_to_str(struct btf *btf, __s32 type_id, char *str)
 				name = btf__str_by_offset(btf, type->name_off);
 				break;
 			case BTF_KIND_TYPEDEF:
-				name = btf__str_by_offset(btf, type->name_off);
-				break;
 			default:
 				name = btf__str_by_offset(btf, type->name_off);
 				break;
@@ -442,7 +438,6 @@ static char *type_id_to_str(struct btf *btf, __s32 type_id, char *str)
 
 static char *value_to_str(struct btf *btf, struct value *val, char *str)
 {
-
 	str = type_id_to_str(btf, val->type_id, str);
 	if (val->flags & KSNOOP_F_PTR)
 		strncat(str, "*", MAX_STR);
@@ -1004,7 +999,6 @@ int main(int argc, char *argv[])
 	if (argc < 0)
 		usage();
 
-	libbpf_set_strict_mode(LIBBPF_STRICT_ALL);
 	libbpf_set_print(libbpf_print_fn);
 
 	return cmd_select(argc, argv);

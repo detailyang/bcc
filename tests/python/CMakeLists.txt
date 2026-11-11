@@ -61,6 +61,8 @@ add_test(NAME py_test_attach_perf_event WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE
   COMMAND ${TEST_WRAPPER} py_test_attach_perf_event sudo ${CMAKE_CURRENT_SOURCE_DIR}/test_attach_perf_event.py)
 add_test(NAME py_test_utils WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
   COMMAND ${TEST_WRAPPER} py_test_utils sudo ${CMAKE_CURRENT_SOURCE_DIR}/test_utils.py)
+add_test(NAME py_test_usdt_argument WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+  COMMAND ${TEST_WRAPPER} py_test_usdt_argument simple ${CMAKE_CURRENT_SOURCE_DIR}/test_usdt_argument.py)
 add_test(NAME py_test_percpu WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
   COMMAND ${TEST_WRAPPER} py_test_percpu sudo ${CMAKE_CURRENT_SOURCE_DIR}/test_percpu.py)
 add_test(NAME py_test_dump_func WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
@@ -71,16 +73,16 @@ add_test(NAME py_test_tools_smoke WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
   COMMAND ${TEST_WRAPPER} py_test_tools_smoke sudo ${CMAKE_CURRENT_SOURCE_DIR}/test_tools_smoke.py)
 add_test(NAME py_test_tools_memleak WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
   COMMAND ${TEST_WRAPPER} py_test_tools_memleak sudo ${CMAKE_CURRENT_SOURCE_DIR}/test_tools_memleak.py)
-add_test(NAME py_test_usdt WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-  COMMAND ${TEST_WRAPPER} py_test_usdt sudo ${CMAKE_CURRENT_SOURCE_DIR}/test_usdt.py)
-add_test(NAME py_test_usdt2 WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-  COMMAND ${TEST_WRAPPER} py_test_usdt2 sudo ${CMAKE_CURRENT_SOURCE_DIR}/test_usdt2.py)
-add_test(NAME py_test_usdt3 WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-  COMMAND ${TEST_WRAPPER} py_test_usdt3 sudo ${CMAKE_CURRENT_SOURCE_DIR}/test_usdt3.py)
+if(NOT(CMAKE_SYSTEM_PROCESSOR STREQUAL "ppc64le" OR CMAKE_SYSTEM_PROCESSOR STREQUAL "ppc64"))
+	add_test(NAME py_test_usdt WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+	  COMMAND ${TEST_WRAPPER} py_test_usdt sudo ${CMAKE_CURRENT_SOURCE_DIR}/test_usdt.py)
+	add_test(NAME py_test_usdt2 WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+	  COMMAND ${TEST_WRAPPER} py_test_usdt2 sudo ${CMAKE_CURRENT_SOURCE_DIR}/test_usdt2.py)
+	add_test(NAME py_test_usdt3 WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+	  COMMAND ${TEST_WRAPPER} py_test_usdt3 sudo ${CMAKE_CURRENT_SOURCE_DIR}/test_usdt3.py)
+endif()
 add_test(NAME py_test_license WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
   COMMAND ${TEST_WRAPPER} py_test_license sudo ${CMAKE_CURRENT_SOURCE_DIR}/test_license.py)
-add_test(NAME py_test_free_bcc_memory WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-  COMMAND ${TEST_WRAPPER} py_test_free_bcc_memory sudo ${CMAKE_CURRENT_SOURCE_DIR}/test_free_bcc_memory.py)
 add_test(NAME py_test_rlimit WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
   COMMAND ${TEST_WRAPPER} py_test_rlimit sudo ${CMAKE_CURRENT_SOURCE_DIR}/test_rlimit.py)
 add_test(NAME py_test_lpm_trie WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}

@@ -6,6 +6,7 @@
  *
  * Based on biotop(8) from BCC by Brendan Gregg.
  * 03-Mar-2022   Francis Laniel   Created this.
+ * 23-Nov-2023   Pcheng Cui       Add PID filter support.
  */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
@@ -23,7 +24,9 @@
 #include <bpf/bpf.h>
 #include "biotop.h"
 #include "biotop.skel.h"
+#include "compat.h"
 #include "trace_helpers.h"
+#include "map_helpers.h"
 
 #define warn(...) fprintf(stderr, __VA_ARGS__)
 #define OUTPUT_ROWS_LIMIT 10240
@@ -56,7 +59,7 @@ int grow_vector(struct vector *vector) {
 		else
 			vector->capacity *= 2;
 
-		reallocated = reallocarray(vector->elems, vector->capacity, sizeof(*vector->elems));
+		reallocated = libbpf_reallocarray(vector->elems, vector->capacity, sizeof(*vector->elems));
 		if (!reallocated)
 			return -1;
 
@@ -82,6 +85,7 @@ static int output_rows = 20;
 static int sort_by = ALL;
 static int interval = 1;
 static int count = 99999999;
+static pid_t target_pid = 0;
 static bool verbose = false;
 
 const char *argp_program_version = "biotop 0.1";
@@ -90,24 +94,26 @@ const char *argp_program_bug_address =
 const char argp_program_doc[] =
 "Trace file reads/writes by process.\n"
 "\n"
-"USAGE: biotop [-h] [interval] [count]\n"
+"USAGE: biotop [-h] [interval] [count] [-p PID]\n"
 "\n"
 "EXAMPLES:\n"
 "    biotop            # file I/O top, refresh every 1s\n"
-"    biotop 5 10       # 5s summaries, 10 times\n";
+"    biotop 5 10       # 5s summaries, 10 times\n"
+"    biotop -p 181     # only trace PID 1216\n";
 
 static const struct argp_option opts[] = {
-	{ "noclear", 'C', NULL, 0, "Don't clear the screen" },
-	{ "sort", 's', "SORT", 0, "Sort columns, default all [all, io, bytes, time]" },
-	{ "rows", 'r', "ROWS", 0, "Maximum rows to print, default 20" },
-	{ "verbose", 'v', NULL, 0, "Verbose debug output" },
-	{ NULL, 'h', NULL, OPTION_HIDDEN, "Show the full help" },
+	{ "noclear", 'C', NULL, 0, "Don't clear the screen", 0 },
+	{ "sort", 's', "SORT", 0, "Sort columns, default all [all, io, bytes, time]", 0 },
+	{ "rows", 'r', "ROWS", 0, "Maximum rows to print, default 20", 0 },
+	{ "pid", 'p', "PID", 0, "Process ID to trace", 0 },
+	{ "verbose", 'v', NULL, 0, "Verbose debug output", 0 },
+	{ NULL, 'h', NULL, OPTION_HIDDEN, "Show the full help", 0 },
 	{},
 };
 
 static error_t parse_arg(int key, char *arg, struct argp_state *state)
 {
-	long rows;
+	long rows, pid;
 	static int pos_args;
 
 	switch (key) {
@@ -138,6 +144,15 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 		output_rows = rows;
 		if (output_rows > OUTPUT_ROWS_LIMIT)
 			output_rows = OUTPUT_ROWS_LIMIT;
+		break;
+	case 'p':
+		errno = 0;
+		pid = strtol(arg, NULL, 10);
+		if (errno || pid <= 0) {
+			warn("Invalid PID: %s\n", arg);
+			argp_usage(state);
+		}
+		target_pid = pid;
 		break;
 	case 'v':
 		verbose = true;
@@ -210,7 +225,7 @@ static int sort_column(const void *obj1, const void *obj2)
 static void parse_disk_stat(void)
 {
 	FILE *fp;
-	char *line;
+	char *line = NULL;
 	size_t zero;
 
 	fp = fopen("/proc/diskstats", "r");
@@ -262,48 +277,46 @@ static char *search_disk_name(int major, int minor)
 	return "";
 }
 
+static int read_stat(struct biotop_bpf *obj, struct data_t *datas, __u32 *count)
+{
+	struct info_t keys[OUTPUT_ROWS_LIMIT];
+	struct val_t values[OUTPUT_ROWS_LIMIT];
+	struct info_t invalid_key = {0};
+	int fd = bpf_map__fd(obj->maps.counts);
+	int err, i;
+
+	err = dump_hash(fd, keys, sizeof(struct info_t), values, sizeof(struct val_t),
+			count, &invalid_key, true /* lookup_and_delete */);
+	if (err)
+		return err;
+
+	/* Store data in datas array */
+	for (i = 0; i < *count; i++) {
+		datas[i].key = keys[i];
+		datas[i].value = values[i];
+	}
+
+	return 0;
+}
+
 static int print_stat(struct biotop_bpf *obj)
 {
-	FILE *f;
-	time_t t;
-	struct tm *tm;
-	char ts[16], buf[256];
-	struct info_t *prev_key = NULL;
+	char loadavg[256], ts[64];
 	static struct data_t datas[OUTPUT_ROWS_LIMIT];
-	int n, i, err = 0, rows = 0;
-	int fd = bpf_map__fd(obj->maps.counts);
+	int i, err = 0, rows = OUTPUT_ROWS_LIMIT;
 
-	f = fopen("/proc/loadavg", "r");
-	if (f) {
-		time(&t);
-		tm = localtime(&t);
-		strftime(ts, sizeof(ts), "%H:%M:%S", tm);
-		memset(buf, 0, sizeof(buf));
-		n = fread(buf, 1, sizeof(buf), f);
-		if (n)
-			printf("%8s loadavg: %s\n", ts, buf);
-		fclose(f);
-	}
+	err = str_loadavg(loadavg, sizeof(loadavg)) <= 0;
+	err = err ?: (str_timestamp("%H:%M:%S", ts, sizeof(ts)) <= 0);
+	if (!err)
+		printf("%8s %s\n", ts, loadavg);
+
 	printf("%-7s %-16s %1s %-3s %-3s %-8s %5s %7s %6s\n",
 	       "PID", "COMM", "D", "MAJ", "MIN", "DISK", "I/O", "Kbytes", "AVGms");
 
-	while (1) {
-		err = bpf_map_get_next_key(fd, prev_key, &datas[rows].key);
-		if (err) {
-			if (errno == ENOENT) {
-				err = 0;
-				break;
-			}
-			warn("bpf_map_get_next_key failed: %s\n", strerror(errno));
-			return err;
-		}
-		err = bpf_map_lookup_elem(fd, &datas[rows].key, &datas[rows].value);
-		if (err) {
-			warn("bpf_map_lookup_elem failed: %s\n", strerror(errno));
-			return err;
-		}
-		prev_key = &datas[rows].key;
-		rows++;
+	err = read_stat(obj, datas, (__u32*) &rows);
+	if (err) {
+		fprintf(stderr, "read stat failed: %s\n", strerror(errno));
+		return err;
 	}
 
 	qsort(datas, rows, sizeof(struct data_t), sort_column);
@@ -329,28 +342,39 @@ static int print_stat(struct biotop_bpf *obj)
 	}
 
 	printf("\n");
-	prev_key = NULL;
-
-	while (1) {
-		struct info_t key;
-
-		err = bpf_map_get_next_key(fd, prev_key, &key);
-		if (err) {
-			if (errno == ENOENT) {
-				err = 0;
-				break;
-			}
-			warn("bpf_map_get_next_key failed: %s\n", strerror(errno));
-			return err;
-		}
-		err = bpf_map_delete_elem(fd, &key);
-		if (err) {
-			warn("bpf_map_delete_elem failed: %s\n", strerror(errno));
-			return err;
-		}
-		prev_key = &key;
-	}
 	return err;
+}
+
+static bool has_block_io_tracepoints(void)
+{
+	return tracepoint_exists("block", "block_io_start") &&
+		tracepoint_exists("block", "block_io_done");
+}
+
+static void disable_block_io_tracepoints(struct biotop_bpf *obj)
+{
+	bpf_program__set_autoload(obj->progs.block_io_start, false);
+	bpf_program__set_autoload(obj->progs.block_io_done, false);
+}
+
+static void disable_blk_account_io_kprobes(struct biotop_bpf *obj)
+{
+	bpf_program__set_autoload(obj->progs.blk_account_io_start, false);
+	bpf_program__set_autoload(obj->progs.blk_account_io_done, false);
+	bpf_program__set_autoload(obj->progs.__blk_account_io_start, false);
+	bpf_program__set_autoload(obj->progs.__blk_account_io_done, false);
+}
+
+static void blk_account_io_set_autoload(struct biotop_bpf *obj,
+					struct ksyms *ksyms)
+{
+	if (!ksyms__get_symbol(ksyms, "__blk_account_io_start")) {
+		bpf_program__set_autoload(obj->progs.__blk_account_io_start, false);
+		bpf_program__set_autoload(obj->progs.__blk_account_io_done, false);
+	} else {
+		bpf_program__set_autoload(obj->progs.blk_account_io_start, false);
+		bpf_program__set_autoload(obj->progs.blk_account_io_done, false);
+	}
 }
 
 int main(int argc, char **argv)
@@ -368,7 +392,6 @@ int main(int argc, char **argv)
 	if (err)
 		return err;
 
-	libbpf_set_strict_mode(LIBBPF_STRICT_ALL);
 	libbpf_set_print(libbpf_print_fn);
 
 	obj = biotop_bpf__open();
@@ -376,6 +399,8 @@ int main(int argc, char **argv)
 		warn("failed to open BPF object\n");
 		return 1;
 	}
+
+	obj->rodata->target_pid = target_pid;
 
 	parse_disk_stat();
 
@@ -386,29 +411,16 @@ int main(int argc, char **argv)
 		goto cleanup;
 	}
 
+	if (has_block_io_tracepoints())
+		disable_blk_account_io_kprobes(obj);
+	else {
+		disable_block_io_tracepoints(obj);
+		blk_account_io_set_autoload(obj, ksyms);
+	}
+
 	err = biotop_bpf__load(obj);
 	if (err) {
 		warn("failed to load BPF object: %d\n", err);
-		goto cleanup;
-	}
-
-	if (ksyms__get_symbol(ksyms, "__blk_account_io_start"))
-		obj->links.blk_account_io_start = bpf_program__attach_kprobe(obj->progs.blk_account_io_start, false, "__blk_account_io_start");
-	else
-		obj->links.blk_account_io_start = bpf_program__attach_kprobe(obj->progs.blk_account_io_start, false, "blk_account_io_start");
-
-	if (!obj->links.blk_account_io_start) {
-		warn("failed to load attach blk_account_io_start\n");
-		goto cleanup;
-	}
-
-	if (ksyms__get_symbol(ksyms, "__blk_account_io_done"))
-		obj->links.blk_account_io_done = bpf_program__attach_kprobe(obj->progs.blk_account_io_done, false, "__blk_account_io_done");
-	else
-		obj->links.blk_account_io_done = bpf_program__attach_kprobe(obj->progs.blk_account_io_done, false, "blk_account_io_done");
-
-	if (!obj->links.blk_account_io_done) {
-		warn("failed to load attach blk_account_io_done\n");
 		goto cleanup;
 	}
 

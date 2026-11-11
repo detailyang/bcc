@@ -44,11 +44,11 @@ const char argp_program_doc[] =
 "    cpufreq -f 199  # sample CPU freq at 199HZ\n";
 
 static const struct argp_option opts[] = {
-	{ "duration", 'd', "DURATION", 0, "Duration to sample in seconds" },
-	{ "frequency", 'f', "FREQUENCY", 0, "Sample with a certain frequency" },
-	{ "cgroup", 'c', "/sys/fs/cgroup/unified", 0, "Trace process in cgroup path" },
-	{ "verbose", 'v', NULL, 0, "Verbose debug output" },
-	{ NULL, 'h', NULL, OPTION_HIDDEN, "Show the full help" },
+	{ "duration", 'd', "DURATION", 0, "Duration to sample in seconds", 0 },
+	{ "frequency", 'f', "FREQUENCY", 0, "Sample with a certain frequency", 0 },
+	{ "cgroup", 'c', "/sys/fs/cgroup/unified", 0, "Trace process in cgroup path", 0 },
+	{ "verbose", 'v', NULL, 0, "Verbose debug output", 0 },
+	{ NULL, 'h', NULL, OPTION_HIDDEN, "Show the full help", 0 },
 	{},
 };
 
@@ -132,21 +132,25 @@ static void sig_handler(int sig)
 {
 }
 
-static int init_freqs_mhz(__u32 *freqs_mhz, int nr_cpus)
+static int init_freqs_mhz(__u32 *freqs_mhz, struct bpf_link *links[])
 {
 	char path[64];
 	FILE *f;
 	int i;
 
 	for (i = 0; i < nr_cpus; i++) {
+		if (!links[i]) {
+			continue;
+		}
 		snprintf(path, sizeof(path),
 			"/sys/devices/system/cpu/cpu%d/cpufreq/scaling_cur_freq",
 			i);
 
 		f = fopen(path, "r");
 		if (!f) {
-			fprintf(stderr, "failed to open '%s': %s\n", path,
-				strerror(errno));
+			fprintf(stderr, "failed to open '%s': %s\n"
+				"This tool depends on CPU Frequency Scaling\n",
+				path, strerror(errno));
 			return -1;
 		}
 		if (fscanf(f, "%u\n", &freqs_mhz[i]) != 1) {
@@ -207,7 +211,6 @@ int main(int argc, char **argv)
 	if (err)
 		return err;
 
-	libbpf_set_strict_mode(LIBBPF_STRICT_ALL);
 	libbpf_set_print(libbpf_print_fn);
 
 	nr_cpus = libbpf_num_possible_cpus();
@@ -233,12 +236,6 @@ int main(int argc, char **argv)
 		goto cleanup;
 	}
 
-	err = init_freqs_mhz(obj->bss->freqs_mhz, nr_cpus);
-	if (err) {
-		fprintf(stderr, "failed to init freqs\n");
-		goto cleanup;
-	}
-
 	obj->bss->filter_cg = env.cg;
 
 	/* update cgroup path fd to map */
@@ -259,6 +256,11 @@ int main(int argc, char **argv)
 	err = open_and_attach_perf_event(env.freq, obj->progs.do_sample, links);
 	if (err)
 		goto cleanup;
+	err = init_freqs_mhz(obj->bss->freqs_mhz, links);
+	if (err) {
+		fprintf(stderr, "failed to init freqs\n");
+		goto cleanup;
+	}
 
 	err = cpufreq_bpf__attach(obj);
 	if (err) {

@@ -179,13 +179,7 @@ static int CreateFromArgs(clang::CompilerInvocation &invocation,
                           const llvm::opt::ArgStringList &ccargs,
                           clang::DiagnosticsEngine &diags)
 {
-#if LLVM_MAJOR_VERSION >= 10
   return clang::CompilerInvocation::CreateFromArgs(invocation, ccargs, diags);
-#else
-  return clang::CompilerInvocation::CreateFromArgs(
-              invocation, const_cast<const char **>(ccargs.data()),
-              const_cast<const char **>(ccargs.data()) + ccargs.size(), diags);
-#endif
 }
 
 }
@@ -265,6 +259,10 @@ int ClangLoader::parse(
                                    "-Wno-pragma-once-outside-header",
                                    "-Wno-address-of-packed-member",
                                    "-Wno-unknown-warning-option",
+#if defined(__x86_64__) || defined(__i386__)
+                                   "-Wno-duplicate-decl-specifier",
+                                   "-fcf-protection",
+#endif
                                    "-fno-color-diagnostics",
                                    "-fno-unwind-tables",
                                    "-fno-asynchronous-unwind-tables",
@@ -284,13 +282,10 @@ int ClangLoader::parse(
   vector<string> kflags;
   if (kbuild_helper.get_flags(un.machine, &kflags))
     return -1;
-#if LLVM_MAJOR_VERSION >= 9
+
   flags_cstr.push_back("-g");
   flags_cstr.push_back("-gdwarf-4");
-#else
-  if (flags_ & DEBUG_SOURCE)
-    flags_cstr.push_back("-g");
-#endif
+
   for (auto it = kflags.begin(); it != kflags.end(); ++it)
     flags_cstr.push_back(it->c_str());
 
@@ -401,21 +396,27 @@ int ClangLoader::do_compile(
                     flags_cstr_rem.end());
 
   // set up the error reporting class
+#if LLVM_VERSION_MAJOR >= 21
+  DiagnosticOptions diag_opts;
+  auto diag_client = new TextDiagnosticPrinter(llvm::errs(), diag_opts);
+
+  IntrusiveRefCntPtr<DiagnosticIDs> DiagID(new DiagnosticIDs());
+  DiagnosticsEngine diags(DiagID, diag_opts, diag_client);
+#else
   IntrusiveRefCntPtr<DiagnosticOptions> diag_opts(new DiagnosticOptions());
   auto diag_client = new TextDiagnosticPrinter(llvm::errs(), &*diag_opts);
 
   IntrusiveRefCntPtr<DiagnosticIDs> DiagID(new DiagnosticIDs());
   DiagnosticsEngine diags(DiagID, &*diag_opts, diag_client);
+#endif
 
   // set up the command line argument wrapper
 
   string target_triple = get_clang_target();
   driver::Driver drv("", target_triple, diags);
 
-#if LLVM_MAJOR_VERSION >= 4
   if (target_triple == "x86_64-unknown-linux-gnu" || target_triple == "aarch64-unknown-linux-gnu")
     flags_cstr.push_back("-fno-jump-tables");
-#endif
 
   drv.setTitle("bcc-clang-driver");
   drv.setCheckInputsExist(false);
@@ -463,7 +464,14 @@ int ClangLoader::do_compile(
   }
   invocation0.getFrontendOpts().DisableFree = false;
 
+#if LLVM_VERSION_MAJOR >= 22
+  compiler0.setVirtualFileSystem(llvm::vfs::getRealFileSystem());
   compiler0.createDiagnostics(new IgnoringDiagConsumer());
+#elif LLVM_VERSION_MAJOR >= 20
+  compiler0.createDiagnostics(*llvm::vfs::getRealFileSystem(), new IgnoringDiagConsumer());
+#else
+  compiler0.createDiagnostics(new IgnoringDiagConsumer());
+#endif
 
   // capture the rewritten c file
   string out_str;
@@ -482,7 +490,14 @@ int ClangLoader::do_compile(
   add_main_input(invocation1, main_path, &*out_buf);
   invocation1.getFrontendOpts().DisableFree = false;
 
+#if LLVM_VERSION_MAJOR >= 22
+  compiler1.setVirtualFileSystem(llvm::vfs::getRealFileSystem());
   compiler1.createDiagnostics();
+#elif LLVM_VERSION_MAJOR >= 20
+  compiler1.createDiagnostics(*llvm::vfs::getRealFileSystem());
+#else
+  compiler1.createDiagnostics();
+#endif
 
   // capture the rewritten c file
   string out_str1;
@@ -508,7 +523,14 @@ int ClangLoader::do_compile(
   invocation2.getCodeGenOpts().setInlining(CodeGenOptions::NormalInlining);
   // suppress warnings in the 2nd pass, but bail out on errors (our fault)
   invocation2.getDiagnosticOpts().IgnoreWarnings = true;
+#if LLVM_VERSION_MAJOR >= 22
+  compiler2.setVirtualFileSystem(llvm::vfs::getRealFileSystem());
   compiler2.createDiagnostics();
+#elif LLVM_VERSION_MAJOR >= 20
+  compiler2.createDiagnostics(*llvm::vfs::getRealFileSystem());
+#else
+  compiler2.createDiagnostics();
+#endif
 
   EmitLLVMOnlyAction ir_act(&*ctx_);
   if (!compiler2.ExecuteAction(ir_act))

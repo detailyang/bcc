@@ -65,14 +65,14 @@ const char argp_program_doc[] =
 "    tcpstates -D 80            # only trace remote port 80\n";
 
 static const struct argp_option opts[] = {
-	{ "verbose", 'v', NULL, 0, "Verbose debug output" },
-	{ "timestamp", 'T', NULL, 0, "Include timestamp on output" },
-	{ "ipv4", '4', NULL, 0, "Trace IPv4 family only" },
-	{ "ipv6", '6', NULL, 0, "Trace IPv6 family only" },
-	{ "wide", 'w', NULL, 0, "Wide column output (fits IPv6 addresses)" },
-	{ "localport", 'L', "LPORT", 0, "Comma-separated list of local ports to trace." },
-	{ "remoteport", 'D', "DPORT", 0, "Comma-separated list of remote ports to trace." },
-	{ NULL, 'h', NULL, OPTION_HIDDEN, "Show the full help" },
+	{ "verbose", 'v', NULL, 0, "Verbose debug output", 0 },
+	{ "timestamp", 'T', NULL, 0, "Include timestamp on output", 0 },
+	{ "ipv4", '4', NULL, 0, "Trace IPv4 family only", 0 },
+	{ "ipv6", '6', NULL, 0, "Trace IPv6 family only", 0 },
+	{ "wide", 'w', NULL, 0, "Wide column output (fits IPv6 addresses)", 0 },
+	{ "localport", 'L', "LPORT", 0, "Comma-separated list of local ports to trace.", 0 },
+	{ "remoteport", 'D', "DPORT", 0, "Comma-separated list of remote ports to trace.", 0 },
+	{ NULL, 'h', NULL, OPTION_HIDDEN, "Show the full help", 0 },
 	{},
 };
 
@@ -153,30 +153,33 @@ static void sig_int(int signo)
 
 static void handle_event(void *ctx, int cpu, void *data, __u32 data_sz)
 {
-	char ts[32], saddr[26], daddr[26];
-	struct event *e = data;
-	struct tm *tm;
+	char ts[32], saddr[39], daddr[39];
+	struct event e;
 	int family;
-	time_t t;
+
+	if (data_sz < sizeof(e)) {
+		printf("Error: packet too small\n");
+		return;
+	}
+	/* Copy data as alignment in the perf buffer isn't guaranteed. */
+	memcpy(&e, data, sizeof(e));
 
 	if (emit_timestamp) {
-		time(&t);
-		tm = localtime(&t);
-		strftime(ts, sizeof(ts), "%H:%M:%S", tm);
+		str_timestamp("%H:%M:%S", ts, sizeof(ts));
 		printf("%8s ", ts);
 	}
 
-	inet_ntop(e->family, &e->saddr, saddr, sizeof(saddr));
-	inet_ntop(e->family, &e->daddr, daddr, sizeof(daddr));
+	inet_ntop(e.family, &e.saddr, saddr, sizeof(saddr));
+	inet_ntop(e.family, &e.daddr, daddr, sizeof(daddr));
 	if (wide_output) {
-		family = e->family == AF_INET ? 4 : 6;
-		printf("%-16llx %-7d %-16s %-2d %-26s %-5d %-26s %-5d %-11s -> %-11s %.3f\n",
-		       e->skaddr, e->pid, e->task, family, saddr, e->sport, daddr, e->dport,
-		       tcp_states[e->oldstate], tcp_states[e->newstate], (double)e->delta_us / 1000);
+		family = e.family == AF_INET ? 4 : 6;
+		printf("%-16llx %-7d %-16s %-2d %-39s %-5d %-39s %-5d %-11s -> %-11s %.3f\n",
+		       e.skaddr, e.pid, e.task, family, saddr, e.sport, daddr, e.dport,
+		       tcp_states[e.oldstate], tcp_states[e.newstate], (double)e.delta_us / 1000);
 	} else {
 		printf("%-16llx %-7d %-10.10s %-15s %-5d %-15s %-5d %-11s -> %-11s %.3f\n",
-		       e->skaddr, e->pid, e->task, saddr, e->sport, daddr, e->dport,
-		       tcp_states[e->oldstate], tcp_states[e->newstate], (double)e->delta_us / 1000);
+		       e.skaddr, e.pid, e.task, saddr, e.sport, daddr, e.dport,
+		       tcp_states[e.oldstate], tcp_states[e.newstate], (double)e.delta_us / 1000);
 	}
 }
 
@@ -203,7 +206,6 @@ int main(int argc, char **argv)
 	if (err)
 		return err;
 
-	libbpf_set_strict_mode(LIBBPF_STRICT_ALL);
 	libbpf_set_print(libbpf_print_fn);
 
 	err = ensure_core_btf(&open_opts);
@@ -270,7 +272,7 @@ int main(int argc, char **argv)
 	if (emit_timestamp)
 		printf("%-8s ", "TIME(s)");
 	if (wide_output)
-		printf("%-16s %-7s %-16s %-2s %-26s %-5s %-26s %-5s %-11s -> %-11s %s\n",
+		printf("%-16s %-7s %-16s %-2s %-39s %-5s %-39s %-5s %-11s -> %-11s %s\n",
 		       "SKADDR", "PID", "COMM", "IP", "LADDR", "LPORT",
 		       "RADDR", "RPORT", "OLDSTATE", "NEWSTATE", "MS");
 	else

@@ -19,13 +19,17 @@
 struct env {
 	bool distributed;
 	bool nanoseconds;
+	bool count;
 	time_t interval;
 	int times;
 	bool timestamp;
 	bool verbose;
+	int targ_cpu;
 } env = {
 	.interval = 99999999,
 	.times = 99999999,
+	.count = false,
+	.targ_cpu = -1,
 };
 
 static volatile bool exiting;
@@ -41,15 +45,18 @@ const char argp_program_doc[] =
 "EXAMPLES:\n"
 "    softirqs            # sum soft irq event time\n"
 "    softirqs -d         # show soft irq event time as histograms\n"
+"    softirqs -c 1       # show soft irq event time on cpu 1\n"
 "    softirqs 1 10       # print 1 second summaries, 10 times\n"
 "    softirqs -NT 1      # 1s summaries, nanoseconds, and timestamps\n";
 
 static const struct argp_option opts[] = {
-	{ "distributed", 'd', NULL, 0, "Show distributions as histograms" },
-	{ "timestamp", 'T', NULL, 0, "Include timestamp on output" },
-	{ "nanoseconds", 'N', NULL, 0, "Output in nanoseconds" },
-	{ "verbose", 'v', NULL, 0, "Verbose debug output" },
-	{ NULL, 'h', NULL, OPTION_HIDDEN, "Show the full help" },
+	{ "distributed", 'd', NULL, 0, "Show distributions as histograms", 0 },
+	{ "timestamp", 'T', NULL, 0, "Include timestamp on output", 0 },
+	{ "nanoseconds", 'N', NULL, 0, "Output in nanoseconds", 0 },
+	{ "count", 'C', NULL, 0, "Show event counts with timing", 0 },
+	{ "cpu", 'c', "CPU", 0, "Trace this cpu only", 0 },
+	{ "verbose", 'v', NULL, 0, "Verbose debug output", 0 },
+	{ NULL, 'h', NULL, OPTION_HIDDEN, "Show the full help", 0 },
 	{},
 };
 
@@ -72,6 +79,17 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 		break;
 	case 'T':
 		env.timestamp = true;
+		break;
+	case 'C':
+		env.count = true;
+		break;
+	case 'c':
+		errno = 0;
+		env.targ_cpu = atoi(arg);
+		if (errno || env.targ_cpu < 0) {
+			fprintf(stderr, "invalid cpu: %s\n", arg);
+			argp_usage(state);
+		}
 		break;
 	case ARGP_KEY_ARG:
 		errno = 0;
@@ -142,16 +160,24 @@ static char *vec_names[] = {
 static int print_count(struct softirqs_bpf__bss *bss)
 {
 	const char *units = env.nanoseconds ? "nsecs" : "usecs";
-	__u64 count;
+	__u64 count, time;
 	__u32 vec;
 
-	printf("%-16s %6s%5s\n", "SOFTIRQ", "TOTAL_", units);
+	printf("%-16s %-6s%-5s  %-11s\n", "SOFTIRQ", "TOTAL_",
+			units, env.count?"TOTAL_count":"");
 
 	for (vec = 0; vec < NR_SOFTIRQS; vec++) {
+		time = __atomic_exchange_n(&bss->time[vec], 0,
+					__ATOMIC_RELAXED);
 		count = __atomic_exchange_n(&bss->counts[vec], 0,
 					__ATOMIC_RELAXED);
-		if (count > 0)
-			printf("%-16s %11llu\n", vec_names[vec], count);
+		if (count > 0) {
+			printf("%-16s %11llu", vec_names[vec], time);
+			if (env.count) {
+				printf("  %11llu", count);
+			}
+			printf("\n");
+		}
 	}
 
 	return 0;
@@ -186,16 +212,13 @@ int main(int argc, char **argv)
 		.doc = argp_program_doc,
 	};
 	struct softirqs_bpf *obj;
-	struct tm *tm;
 	char ts[32];
-	time_t t;
 	int err;
 
 	err = argp_parse(&argp, argc, argv, 0, NULL, NULL);
 	if (err)
 		return err;
 
-	libbpf_set_strict_mode(LIBBPF_STRICT_ALL);
 	libbpf_set_print(libbpf_print_fn);
 
 	obj = softirqs_bpf__open();
@@ -215,6 +238,7 @@ int main(int argc, char **argv)
 	/* initialize global data (filtering options) */
 	obj->rodata->targ_dist = env.distributed;
 	obj->rodata->targ_ns = env.nanoseconds;
+	obj->rodata->targ_cpu = env.targ_cpu;
 
 	err = softirqs_bpf__load(obj);
 	if (err) {
@@ -243,9 +267,7 @@ int main(int argc, char **argv)
 		printf("\n");
 
 		if (env.timestamp) {
-			time(&t);
-			tm = localtime(&t);
-			strftime(ts, sizeof(ts), "%H:%M:%S", tm);
+			str_timestamp("%H:%M:%S", ts, sizeof(ts));
 			printf("%-8s\n", ts);
 		}
 

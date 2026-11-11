@@ -17,19 +17,23 @@
 #define _GNU_SOURCE
 #endif
 
+#include "libbpf.h"
+
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
+#include <libgen.h>
 #include <limits.h>
 #include <linux/bpf.h>
 #include <linux/bpf_common.h>
+#include <linux/if_alg.h>
 #include <linux/if_packet.h>
-#include <linux/types.h>
 #include <linux/perf_event.h>
 #include <linux/pkt_cls.h>
 #include <linux/rtnetlink.h>
 #include <linux/sched.h>
+#include <linux/types.h>
 #include <linux/unistd.h>
 #include <linux/version.h>
 #include <net/ethernet.h>
@@ -38,7 +42,6 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <libgen.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/resource.h>
@@ -46,9 +49,8 @@
 #include <sys/types.h>
 #include <sys/vfs.h>
 #include <unistd.h>
-#include <linux/if_alg.h>
 
-#include "libbpf.h"
+#include "bcc_zip.h"
 #include "perf_reader.h"
 
 // TODO: Remove this when CentOS 6 support is not needed anymore
@@ -314,6 +316,8 @@ static struct bpf_helper helpers[] = {
   {"tcp_raw_check_syncookie_ipv6", "6.0"},
   {"ktime_get_tai_ns", "6.1"},
   {"user_ringbuf_drain", "6.1"},
+  {"cgrp_storage_get", "6.2"},
+  {"cgrp_storage_delete", "6.2"},
 };
 
 static uint64_t ptr_to_u64(void *ptr)
@@ -670,6 +674,7 @@ static int libbpf_bpf_prog_load(enum bpf_prog_type prog_type,
   case BPF_PROG_TYPE_EXT:
     p.attach_btf_id = opts->attach_btf_id;
     p.attach_prog_fd = opts->attach_prog_fd;
+    p.attach_btf_obj_fd = opts->attach_btf_obj_fd;
     break;
   default:
     p.prog_ifindex = opts->prog_ifindex;
@@ -691,6 +696,86 @@ static int libbpf_bpf_prog_load(enum bpf_prog_type prog_type,
                        insns, insn_cnt, &p);
 }
 
+static int find_btf_id(const char *module_name, const char *func_name,
+                       enum bpf_attach_type expected_attach_type, int *btf_fd)
+{
+  struct btf *vmlinux_btf = NULL, *module_btf = NULL;
+  struct bpf_btf_info info;
+  int err, fd, btf_id;
+  __u32 id = 0, len;
+  char name[64];
+
+  if (!module_name[0] || !strcmp(module_name, "vmlinux"))
+    return libbpf_find_vmlinux_btf_id(func_name, expected_attach_type);
+
+  while (true) {
+    err = bpf_btf_get_next_id(id, &id);
+    if (err) {
+      fprintf(stderr, "bpf_btf_get_next_id failed: %d\n", err);
+      return err;
+    }
+
+    fd = bpf_btf_get_fd_by_id(id);
+    if (fd < 0) {
+      err = fd;
+      fprintf(stderr, "bpf_btf_get_fd_by_id failed: %d\n", err);
+      return err;
+    }
+
+    len = sizeof(info);
+    memset(&info, 0, sizeof(info));
+    info.name = ptr_to_u64(name);
+    info.name_len = sizeof(name);
+
+    err = bpf_btf_get_info_by_fd(fd, &info, &len);
+    if (err) {
+      fprintf(stderr, "bpf_btf_get_info_by_fd failed: %d\n", err);
+      goto err_out;
+    }
+
+    if (!info.kernel_btf || strcmp(name, module_name)) {
+      close(fd);
+      continue;
+    }
+
+    vmlinux_btf = btf__load_vmlinux_btf();
+    err = libbpf_get_error(vmlinux_btf);
+    if (err) {
+      fprintf(stderr, "btf__load_vmlinux_btf failed: %d\n", err);
+      goto err_out;
+    }
+
+    module_btf = btf__load_module_btf(module_name, vmlinux_btf);
+    err = libbpf_get_error(vmlinux_btf);
+    if (err) {
+      fprintf(stderr, "btf__load_module_btf failed: %d\n", err);
+      goto err_out;
+    }
+
+    btf_id = btf__find_by_name_kind(module_btf, func_name, BTF_KIND_FUNC);
+    if (btf_id < 0) {
+      err = btf_id;
+      fprintf(stderr, "btf__find_by_name_kind failed: %d\n", err);
+      goto err_out;
+    }
+
+    btf__free(module_btf);
+    btf__free(vmlinux_btf);
+
+    *btf_fd = fd;
+    return btf_id;
+
+err_out:
+    btf__free(module_btf);
+    btf__free(vmlinux_btf);
+    close(fd);
+    *btf_fd = -1;
+    return err;
+  }
+
+  return -1;
+}
+
 int bcc_prog_load_xattr(enum bpf_prog_type prog_type, const char *prog_name,
                         const char *license, const struct bpf_insn *insns,
                         struct bpf_prog_load_opts *opts, int prog_len,
@@ -701,6 +786,10 @@ int bcc_prog_load_xattr(enum bpf_prog_type prog_type, const char *prog_name,
   unsigned tmp_log_buf_size = 0, opts_log_buf_size = 0;
   int ret = 0, name_offset = 0, expected_attach_type = 0;
   char new_prog_name[BPF_OBJ_NAME_LEN] = {};
+  char mod_name[64] = {};
+  const char *mod_end;
+  int mod_len;
+  int fd = -1;
 
   unsigned insns_cnt = prog_len / sizeof(struct bpf_insn);
 
@@ -726,7 +815,6 @@ int bcc_prog_load_xattr(enum bpf_prog_type prog_type, const char *prog_name,
     }
   }
 
-
   if (name_len) {
     if (strncmp(prog_name, "kprobe__", 8) == 0)
       name_offset = 8;
@@ -737,13 +825,21 @@ int bcc_prog_load_xattr(enum bpf_prog_type prog_type, const char *prog_name,
     else if (strncmp(prog_name, "raw_tracepoint__", 16) == 0)
       name_offset = 16;
     else if (strncmp(prog_name, "kfunc__", 7) == 0) {
-      name_offset = 7;
+      // kfunc__vmlinux__vfs_read
+      mod_end = strstr(prog_name + 7, "__");
+      mod_len = mod_end - prog_name - 7;
+      strncpy(mod_name, prog_name + 7, mod_len);
+      name_offset = 7 + mod_len + 2;
       expected_attach_type = BPF_TRACE_FENTRY;
     } else if (strncmp(prog_name, "kmod_ret__", 10) == 0) {
       name_offset = 10;
       expected_attach_type = BPF_MODIFY_RETURN;
     } else if (strncmp(prog_name, "kretfunc__", 10) == 0) {
-      name_offset = 10;
+      // kretfunc__vmlinux__vfs_read
+      mod_end = strstr(prog_name + 10, "__");
+      mod_len = mod_end - prog_name - 10;
+      strncpy(mod_name, prog_name + 10, mod_len);
+      name_offset = 10 + mod_len + 2;
       expected_attach_type = BPF_TRACE_FEXIT;
     } else if (strncmp(prog_name, "lsm__", 5) == 0) {
       name_offset = 5;
@@ -755,17 +851,18 @@ int bcc_prog_load_xattr(enum bpf_prog_type prog_type, const char *prog_name,
 
     if (prog_type == BPF_PROG_TYPE_TRACING ||
         prog_type == BPF_PROG_TYPE_LSM) {
-      ret = libbpf_find_vmlinux_btf_id(prog_name + name_offset,
-                                       expected_attach_type);
+      ret = find_btf_id(mod_name, prog_name + name_offset,
+                        expected_attach_type, &fd);
       if (ret == -EINVAL) {
-        fprintf(stderr, "bpf: vmlinux BTF is not found\n");
+        fprintf(stderr, "bpf: %s BTF is not found\n", mod_name);
         return ret;
       } else if (ret < 0) {
-        fprintf(stderr, "bpf: %s is not found in vmlinux BTF\n",
-                prog_name + name_offset);
+        fprintf(stderr, "bpf: %s is not found in %s BTF\n",
+                prog_name + name_offset, mod_name);
         return ret;
       }
 
+      opts->attach_btf_obj_fd = fd == -1 ? 0 : fd;
       opts->attach_btf_id = ret;
       opts->expected_attach_type = expected_attach_type;
     }
@@ -877,6 +974,8 @@ int bcc_prog_load_xattr(enum bpf_prog_type prog_type, const char *prog_name,
   }
 
 return_result:
+  if (fd >= 0)
+    close(fd);
   if (tmp_log_buf)
     free(tmp_log_buf);
   return ret;
@@ -1259,10 +1358,42 @@ int bpf_attach_kprobe(int progfd, enum bpf_probe_attach_type attach_type,
                           fn_offset, -1, maxactive, 0);
 }
 
+static int _find_archive_path_and_offset(const char *entry_path,
+                                         char out_path[PATH_MAX],
+                                         uint64_t *offset) {
+  const char *separator = strstr(entry_path, "!/");
+  if (separator == NULL || (separator - entry_path) >= PATH_MAX) {
+    return -1;
+  }
+
+  struct bcc_zip_entry entry;
+  struct bcc_zip_archive *archive =
+      bcc_zip_archive_open_and_find(entry_path, &entry);
+  if (archive == NULL) {
+    return -1;
+  }
+  if (entry.compression) {
+    bcc_zip_archive_close(archive);
+    return -1;
+  }
+
+  strncpy(out_path, entry_path, separator - entry_path);
+  out_path[separator - entry_path] = 0;
+  *offset += entry.data_offset;
+
+  bcc_zip_archive_close(archive);
+  return 0;
+}
+
 int bpf_attach_uprobe(int progfd, enum bpf_probe_attach_type attach_type,
                       const char *ev_name, const char *binary_path,
                       uint64_t offset, pid_t pid, uint32_t ref_ctr_offset)
 {
+  char archive_path[PATH_MAX];
+  if (access(binary_path, F_OK) != 0 &&
+      _find_archive_path_and_offset(binary_path, archive_path, &offset) == 0) {
+    binary_path = archive_path;
+  }
 
   return bpf_attach_probe(progfd, attach_type,
                           ev_name, binary_path, "uprobe",
@@ -1407,6 +1538,78 @@ static int find_member_by_name(struct btf *btf, const struct btf_type *btf_type,
     }
   }
   return 0;
+}
+
+static int find_val_in_enum(struct btf *btf, const struct btf_type *btf_type, const char * val_name)
+{
+  const struct btf_enum *enums = btf_enum(btf_type);
+  uint16_t vlen = BTF_INFO_VLEN(btf_type->info);
+  int found = 0;
+
+  for (uint16_t i = 0; i < vlen; i++) {
+    const struct btf_enum *e = &enums[i];
+    const char *member_name = btf__name_by_offset(btf, e->name_off);
+
+    if (member_name && strcmp(member_name, val_name) == 0) {
+      found = 1;
+      break;
+    }
+  }
+  return found;
+}
+
+static int find_enum_by_name(struct btf *btf, const char *enum_name, const char *val_name)
+{
+  const struct btf_type *btf_type;
+  int ret, btf_id;
+
+  btf_id = btf__find_by_name_kind(btf, enum_name, BTF_KIND_ENUM);
+  if (btf_id < 0) {
+    ret = -1;
+  } else {
+    btf_type = btf__type_by_id(btf, btf_id);
+    ret = find_val_in_enum(btf, btf_type, val_name);
+  }
+  return ret;
+}
+
+static int find_enum_by_anony(struct btf *btf, const char *val_name)
+{
+  __u32 nr_types;
+  int ret = 0;
+
+  nr_types = btf__type_cnt(btf);
+
+  for (int i = 1; i < nr_types; i++) {
+    const struct btf_type *btf_type = btf__type_by_id(btf, i);
+
+    if (!btf_type || btf_kind(btf_type) != BTF_KIND_ENUM || btf_type->name_off != 0)
+      continue;
+
+    ret = find_val_in_enum(btf, btf_type, val_name);
+    if (ret)
+      break;
+  }
+  return ret;
+}
+
+int kernel_enum_has_val(const char *enum_name, const char *val_name)
+{
+  struct btf *btf;
+  int ret;
+
+  btf = btf__load_vmlinux_btf();
+  ret = libbpf_get_error(btf);
+  if (ret)
+    return -1;
+
+  if (!enum_name || strlen(enum_name) == 0)
+    ret = find_enum_by_anony(btf, val_name);
+  else
+    ret = find_enum_by_name(btf, enum_name, val_name);
+
+  btf__free(btf);
+  return ret;
 }
 
 int kernel_struct_has_field(const char *struct_name, const char *field_name)

@@ -36,8 +36,8 @@ const char argp_program_doc[] =
 "USAGE: mdflush\n";
 
 static const struct argp_option opts[] = {
-	{ "verbose", 'v', NULL, 0, "Verbose debug output" },
-	{ NULL, 'h', NULL, OPTION_HIDDEN, "Show the full help" },
+	{ "verbose", 'v', NULL, 0, "Verbose debug output", 0 },
+	{ NULL, 'h', NULL, OPTION_HIDDEN, "Show the full help", 0 },
 	{},
 };
 
@@ -71,13 +71,9 @@ static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va
 static void handle_event(void *ctx, int cpu, void *data, __u32 data_sz)
 {
 	struct event *e = data;
-	time_t t;
-	struct tm *tm;
 	char ts[32];
 
-	time(&t);
-	tm = localtime(&t);
-	strftime(ts, sizeof(ts), "%H:%M:%S", tm);
+	str_timestamp("%H:%M:%S", ts, sizeof(ts));
 	printf("%-8s %-7d %-16s %-s\n",
 	       ts, e->pid, e->comm, e->disk);
 }
@@ -102,13 +98,23 @@ int main(int argc, char **argv)
 	if (err)
 		return err;
 
-	libbpf_set_strict_mode(LIBBPF_STRICT_ALL);
 	libbpf_set_print(libbpf_print_fn);
 
-	obj = mdflush_bpf__open_and_load();
+	obj = mdflush_bpf__open();
 	if (!obj) {
-		warn("failed to open/load BPF object\n");
+		warn("failed to open BPF object\n");
 		return 1;
+	}
+
+	if (fentry_can_attach("md_flush_request", NULL))
+		bpf_program__set_autoload(obj->progs.kprobe_md_flush_request, false);
+	else
+		bpf_program__set_autoload(obj->progs.md_flush_request, false);
+
+	err = mdflush_bpf__load(obj);
+	if (err) {
+		warn("failed to load BPF object: %d\n", err);
+		goto cleanup;
 	}
 
 	err = mdflush_bpf__attach(obj);

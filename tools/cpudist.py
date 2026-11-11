@@ -20,6 +20,7 @@ from __future__ import print_function
 from bcc import BPF
 from time import sleep, strftime
 import argparse
+import os
 
 examples = """examples:
     cpudist              # summarize on-CPU time as a histogram
@@ -96,7 +97,7 @@ static inline void store_start(u32 tgid, u32 pid, u32 cpu, u64 ts)
     if (IDLE_FILTER)
         return;
 
-    entry_key_t entry_key = { .pid = pid, .cpu = cpu };
+    entry_key_t entry_key = { .pid = pid, .cpu = (pid == 0 ? cpu : 0xFFFFFFFF) };
     start.update(&entry_key, &ts);
 }
 
@@ -108,7 +109,7 @@ static inline void update_hist(u32 tgid, u32 pid, u32 cpu, u64 ts)
     if (IDLE_FILTER)
         return;
 
-    entry_key_t entry_key = { .pid = pid, .cpu = cpu };
+    entry_key_t entry_key = { .pid = pid, .cpu = (pid == 0 ? cpu : 0xFFFFFFFF) };
     u64 *tsp = start.lookup(&entry_key);
     if (tsp == 0)
         return;
@@ -130,8 +131,17 @@ int sched_switch(struct pt_regs *ctx, struct task_struct *prev)
     u32 tgid = pid_tgid >> 32, pid = pid_tgid;
     u32 cpu = bpf_get_smp_processor_id();
 
+    struct bpf_pidns_info ns = {};
+    if (USE_PIDNS && !bpf_get_ns_current_pid_tgid(PIDNS_DEV, PIDNS_INO, &ns, sizeof(struct bpf_pidns_info))) {
+        PID_STORE
+
+        tgid = ns.tgid;
+        pid = ns.pid;
+    }
+
     u32 prev_pid = prev->pid;
     u32 prev_tgid = prev->tgid;
+    PID_TRANSLATE
 #ifdef ONCPU
     update_hist(prev_tgid, prev_pid, cpu, ts);
 #else
@@ -169,6 +179,32 @@ else:
 
 storage_str = ""
 store_str = ""
+pid_store = ""
+pid_translate = ""
+
+try:
+    devinfo = os.stat("/proc/self/ns/pid")
+    version = "".join([ver.zfill(2) for ver in os.uname().release.split(".")])
+    # Need Linux >= 5.7 to have helper bpf_get_ns_current_pid_tgid() available:
+    assert(version[:4] >= "0507")
+    bpf_text = bpf_text.replace('USE_PIDNS', "1")
+    bpf_text = bpf_text.replace('PIDNS_DEV', str(devinfo.st_dev))
+    bpf_text = bpf_text.replace('PIDNS_INO', str(devinfo.st_ino))
+    storage_str = "BPF_HASH(ns_pid, u32, u32, MAX_PID);\n"
+    pid_store = """ns_pid.update(&pid, &ns.pid);
+        ns_pid.update(&tgid, &ns.tgid);"""
+    pid_translate = """
+        u32 *ns_pid_val = ns_pid.lookup(&prev_pid);
+        u32 *ns_tgid_val = ns_pid.lookup(&prev_tgid);
+        if (ns_pid_val && ns_tgid_val) {
+            prev_pid = *ns_pid_val;
+            prev_tgid = *ns_tgid_val;
+        }
+    """
+except:
+    bpf_text = bpf_text.replace('USE_PIDNS', "0")
+    bpf_text = bpf_text.replace('PIDNS_DEV', "0")
+    bpf_text = bpf_text.replace('PIDNS_INO', "0")
 
 if args.pids or args.tids:
     section = "pid"
@@ -197,6 +233,8 @@ if args.extension:
     }
     """
 
+bpf_text = bpf_text.replace("PID_STORE", pid_store)
+bpf_text = bpf_text.replace("PID_TRANSLATE", pid_translate)
 bpf_text = bpf_text.replace("STORAGE", storage_str)
 bpf_text = bpf_text.replace("STORE", store_str)
 
@@ -208,7 +246,7 @@ if debug or args.ebpf:
 max_pid = int(open("/proc/sys/kernel/pid_max").read())
 
 b = BPF(text=bpf_text, cflags=["-DMAX_PID=%d" % max_pid])
-b.attach_kprobe(event_re="^finish_task_switch$|^finish_task_switch\.isra\.\d$",
+b.attach_kprobe(event_re=r'^finish_task_switch$|^finish_task_switch\.isra\.\d$',
                 fn_name="sched_switch")
 
 print("Tracing %s-CPU time... Hit Ctrl-C to end." %

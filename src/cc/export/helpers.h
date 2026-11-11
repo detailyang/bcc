@@ -188,11 +188,21 @@ BPF_TABLE(_table_type, _key_type, _leaf_type, _name, _max_entries); \
 __attribute__((section("maps/export"))) \
 struct _name##_table_t __##_name
 
-// define a table that is shared across the programs in the same namespace
-#define BPF_TABLE_SHARED(_table_type, _key_type, _leaf_type, _name, _max_entries) \
-BPF_TABLE(_table_type, _key_type, _leaf_type, _name, _max_entries); \
+#define BPF_TABLE_SHARED6(_table_type, _key_type, _leaf_type, _name, _max_entries, _flags) \
+BPF_F_TABLE(_table_type, _key_type, _leaf_type, _name, _max_entries, _flags); \
 __attribute__((section("maps/shared"))) \
 struct _name##_table_t __##_name
+
+#define BPF_TABLE_SHARED5(_table_type, _key_type, _leaf_type, _name, _max_entries) \
+BPF_F_TABLE(_table_type, _key_type, _leaf_type, _name, _max_entries, 0); \
+__attribute__((section("maps/shared"))) \
+struct _name##_table_t __##_name
+
+#define BPF_TABLE_SHAREDX(_1, _2, _3, _4, _5, _6, NAME, ...) NAME
+
+// define a table that is shared across the programs in the same namespace with optional flags
+#define BPF_TABLE_SHARED(...) \
+  BPF_TABLE_SHAREDX(__VA_ARGS__, BPF_TABLE_SHARED6, BPF_TABLE_SHARED5)(__VA_ARGS__)
 
 // Identifier for current CPU used in perf_submit and perf_read
 // Prefer BPF_F_CURRENT_CPU flag, falls back to call helper for older kernel
@@ -231,6 +241,8 @@ struct _name##_table_t { \
   void (*ringbuf_discard) (void *, u64); \
   /* map.ringbuf_submit(data, flags) */ \
   void (*ringbuf_submit) (void *, u64); \
+  /* map.ringbuf_query(flags) */ \
+  u64 (*ringbuf_query) (u64); \
   u32 max_entries; \
 }; \
 __attribute__((section("maps/ringbuf"))) \
@@ -549,8 +561,8 @@ static int (*bpf_probe_read_str)(void *dst, u64 size, const void *unsafe_ptr) =
   (void *) BPF_FUNC_probe_read_str;
 int bpf_trace_printk(const char *fmt, ...) asm("llvm.bpf.extra");
 static inline __attribute__((always_inline))
-void bpf_tail_call_(u64 map_fd, void *ctx, int index) {
-  ((void (*)(void *, u64, int))BPF_FUNC_tail_call)(ctx, map_fd, index);
+void bpf_tail_call_(void *map_fd, void *ctx, int index) {
+  ((void (*)(void *, u64, int))BPF_FUNC_tail_call)(ctx, (u64)map_fd, index);
 }
 static int (*bpf_clone_redirect)(void *ctx, int ifindex, u32 flags) =
   (void *) BPF_FUNC_clone_redirect;
@@ -1006,13 +1018,13 @@ static void (*bpf_ringbuf_submit_dynptr)(struct bpf_dynptr *ptr, __u64 flags) =
   (void *)BPF_FUNC_ringbuf_submit_dynptr;
 static void (*bpf_ringbuf_discard_dynptr)(struct bpf_dynptr *ptr, __u64 flags) =
   (void *)BPF_FUNC_ringbuf_discard_dynptr;
-static long (*bpf_dynptr_read)(void *dst, __u32 len, struct bpf_dynptr *src, __u32 offset,
+static long (*bpf_dynptr_read)(void *dst, __u32 len, const struct bpf_dynptr *src, __u32 offset,
 			       __u64 flags) =
   (void *)BPF_FUNC_dynptr_read;
-static long (*bpf_dynptr_write)(struct bpf_dynptr *dst, __u32 offset, void *src, __u32 len,
+static long (*bpf_dynptr_write)(const struct bpf_dynptr *dst, __u32 offset, void *src, __u32 len,
 				__u64 flags) =
   (void *)BPF_FUNC_dynptr_write;
-static void *(*bpf_dynptr_data)(struct bpf_dynptr *ptr, __u32 offset, __u32 len) =
+static void *(*bpf_dynptr_data)(const struct bpf_dynptr *ptr, __u32 offset, __u32 len) =
   (void *)BPF_FUNC_dynptr_data;
 static __s64 (*bpf_tcp_raw_gen_syncookie_ipv4)(struct iphdr *iph, struct tcphdr *th,
 					       __u32 th_len) =
@@ -1028,6 +1040,12 @@ static long (*bpf_tcp_raw_check_syncookie_ipv6)(struct ipv6hdr *iph, struct tcph
 static __u64 (*bpf_ktime_get_tai_ns)(void) = (void *)BPF_FUNC_ktime_get_tai_ns;
 static long (*bpf_user_ringbuf_drain)(void *map, void *callback_fn, void *ctx, __u64 flags) =
   (void *)BPF_FUNC_user_ringbuf_drain;
+
+struct cgroup;
+static void *(*bpf_cgrp_storage_get)(void *map, struct cgroup *cgroup, void *value, __u64 flags) =
+  (void *)BPF_FUNC_cgrp_storage_get;
+static long (*bpf_cgrp_storage_delete)(void *map, struct cgroup *cgroup) =
+  (void *)BPF_FUNC_cgrp_storage_delete;
 
 /* llvm builtin functions that eBPF C program may use to
  * emit BPF_LD_ABS and BPF_LD_IND instructions
@@ -1473,10 +1491,16 @@ int name(unsigned long long *ctx)                               \
 static int ____##name(unsigned long long *ctx, ##args)
 
 #define KFUNC_PROBE(event, args...) \
-        BPF_PROG(kfunc__ ## event, ##args)
+        BPF_PROG(kfunc__vmlinux__ ## event, ##args)
 
 #define KRETFUNC_PROBE(event, args...) \
-        BPF_PROG(kretfunc__ ## event, ##args)
+        BPF_PROG(kretfunc__vmlinux__ ## event, ##args)
+
+#define MODULE_KFUNC_PROBE(module, event, args...) \
+        BPF_PROG(kfunc__ ## module ## __ ## event, ##args)
+
+#define MODULE_KRETFUNC_PROBE(module, event, args...) \
+        BPF_PROG(kretfunc__ ## module ## __ ## event, ##args)
 
 #define KMOD_RET(event, args...) \
         BPF_PROG(kmod_ret__ ## event, ##args)

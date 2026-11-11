@@ -39,7 +39,7 @@ static int probe_entry(struct pt_regs *ctx)
 	event.time = bpf_ktime_get_ns();
 	event.pid = pid;
 	bpf_get_current_comm(&event.comm, sizeof(event.comm));
-	bpf_probe_read_user(&event.host, sizeof(event.host), (void *)PT_REGS_PARM1(ctx));
+	bpf_probe_read_user_str(&event.host, sizeof(event.host), (void *)PT_REGS_PARM1(ctx));
 	bpf_map_update_elem(&starts, &tid, &event, BPF_ANY);
 	return 0;
 }
@@ -60,14 +60,14 @@ static int probe_return(struct pt_regs *ctx)
 	return 0;
 }
 
-SEC("kprobe/handle_entry")
-int handle_entry(struct pt_regs *ctx)
+SEC("uprobe")
+int BPF_UPROBE(handle_entry)
 {
 	return probe_entry(ctx);
 }
 
-SEC("kretprobe/handle_return")
-int handle_return(struct pt_regs *ctx)
+SEC("uretprobe")
+int BPF_URETPROBE(handle_return)
 {
 	return probe_return(ctx);
 }

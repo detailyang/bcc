@@ -45,10 +45,10 @@ const char argp_program_doc[] =
 "    gethostlatency -p 1216     # only trace PID 1216\n";
 
 static const struct argp_option opts[] = {
-	{ "pid", 'p', "PID", 0, "Process ID to trace" },
-	{ "libc", 'l', "LIBC", 0, "Specify which libc.so to use" },
-	{ "verbose", 'v', NULL, 0, "Verbose debug output" },
-	{ NULL, 'h', NULL, OPTION_HIDDEN, "Show the full help" },
+	{ "pid", 'p', "PID", 0, "Process ID to trace", 0 },
+	{ "libc", 'l', "LIBC", 0, "Specify which libc.so to use", 0 },
+	{ "verbose", 'v', NULL, 0, "Verbose debug output", 0 },
+	{ NULL, 'h', NULL, OPTION_HIDDEN, "Show the full help", 0 },
 	{},
 };
 
@@ -99,16 +99,18 @@ static void sig_int(int signo)
 
 static void handle_event(void *ctx, int cpu, void *data, __u32 data_sz)
 {
-	const struct event *e = data;
-	struct tm *tm;
+	struct event e;
 	char ts[16];
-	time_t t;
 
-	time(&t);
-	tm = localtime(&t);
-	strftime(ts, sizeof(ts), "%H:%M:%S", tm);
+	if (data_sz < sizeof(e)) {
+		printf("Error: packet too small\n");
+		return;
+	}
+	/* Copy data as alignment in the perf buffer isn't guaranteed. */
+	memcpy(&e, data, sizeof(e));
+	str_timestamp("%H:%M:%S", ts, sizeof(ts));
 	printf("%-8s %-7d %-16s %-10.3f %-s\n",
-	       ts, e->pid, e->comm, (double)e->time/1000000, e->host);
+	       ts, e.pid, e.comm, (double)e.time/1000000, e.host);
 }
 
 static void handle_lost_events(void *ctx, int cpu, __u64 lost_cnt)
@@ -118,17 +120,23 @@ static void handle_lost_events(void *ctx, int cpu, __u64 lost_cnt)
 
 static int get_libc_path(char *path)
 {
-	FILE *f;
+	char proc_path[PATH_MAX + 32] = {};
 	char buf[PATH_MAX] = {};
 	char *filename;
 	float version;
+	FILE *f;
 
 	if (libc_path) {
 		memcpy(path, libc_path, strlen(libc_path));
 		return 0;
 	}
 
-	f = fopen("/proc/self/maps", "r");
+	if (target_pid == 0) {
+		f = fopen("/proc/self/maps", "r");
+	} else {
+		snprintf(buf, sizeof(buf), "/proc/%d/maps", target_pid);
+		f = fopen(buf, "r");
+	}
 	if (!f)
 		return -errno;
 
@@ -138,7 +146,12 @@ static int get_libc_path(char *path)
 		filename = strrchr(buf, '/') + 1;
 		if (sscanf(filename, "libc-%f.so", &version) == 1 ||
 		    sscanf(filename, "libc.so.%f", &version) == 1) {
-			memcpy(path, buf, strlen(buf));
+			if (target_pid == 0) {
+				memcpy(path, buf, strlen(buf));
+			} else {
+				snprintf(proc_path, sizeof(proc_path), "/proc/%d/root%s", target_pid, buf);
+				memcpy(path, proc_path, strlen(proc_path));
+			}
 			fclose(f);
 			return 0;
 		}
@@ -234,7 +247,6 @@ int main(int argc, char **argv)
 	if (err)
 		return err;
 
-	libbpf_set_strict_mode(LIBBPF_STRICT_ALL);
 	libbpf_set_print(libbpf_print_fn);
 
 	err = ensure_core_btf(&open_opts);

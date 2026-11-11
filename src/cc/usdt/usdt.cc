@@ -44,6 +44,8 @@ Location::Location(uint64_t addr, const std::string &bin_path, const char *arg_f
   ArgumentParser_powerpc64 parser(arg_fmt);
 #elif __s390x__
   ArgumentParser_s390x parser(arg_fmt);
+#elif __riscv
+  ArgumentParser_riscv64 parser(arg_fmt);
 #else
   ArgumentParser_x64 parser(arg_fmt);
 #endif
@@ -76,7 +78,7 @@ bool Probe::in_shared_object(const std::string &bin_path) {
 
 bool Probe::resolve_global_address(uint64_t *global, const std::string &bin_path,
                                    const uint64_t addr) {
-  if (in_shared_object(bin_path)) {
+  if (in_shared_object(bin_path) || bcc_elf_is_pie(bin_path.c_str())) {
     return (pid_ &&
             !bcc_resolve_global_addr(*pid_, bin_path.c_str(), addr, mod_match_inode_only_, global));
   }

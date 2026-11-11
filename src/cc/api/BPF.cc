@@ -118,13 +118,14 @@ StatusTuple BPF::init(const std::string& bpf_program,
     }
   }
 
-  auto flags_len = cflags.size();
-  const char* flags[flags_len];
-  for (size_t i = 0; i < flags_len; i++)
-    flags[i] = cflags[i].c_str();
+  std::vector<const char*> flags;
+  for (const auto& c: cflags)
+    flags.push_back(c.c_str());
 
   all_bpf_program_ += bpf_program;
-  if (bpf_module_->load_string(all_bpf_program_, flags, flags_len) != 0) {
+  if (bpf_module_->load_string(all_bpf_program_,
+                               flags.data(),
+                               flags.size()) != 0) {
     init_fail_reset();
     return StatusTuple(-1, "Unable to initialize BPF program");
   }
@@ -527,6 +528,35 @@ StatusTuple BPF::detach_uprobe(const std::string& binary_path,
   return StatusTuple::OK();
 }
 
+// Detach all uprobes associated with the given binary path.
+// This function cleans up all matching uprobes without checking if the binary file exists.
+// It simply matches the sanitized binary path in the event names and detaches them.
+
+StatusTuple BPF::detach_all_uprobes_for_binary(const std::string& binary_path) {
+  bool has_error = false;
+  std::string error_msg;
+  std::vector<std::string> to_detach;
+
+  // Sanitize the binary path as used in event names
+  std::string sanitized_path = sanitize_str(binary_path, &BPF::uprobe_path_validator);
+  // Find all uprobes for this binary
+  for (auto& it : uprobes_) {
+    if (it.first.find(sanitized_path) != std::string::npos) {
+      auto res = detach_uprobe_event(it.first, it.second);
+      if (!res.ok()) {
+        error_msg += "Failed to detach uprobe event " + it.first + ": ";
+        error_msg += res.msg() + "\n";
+        has_error = true;
+      }
+      uprobes_.erase(it.first);
+    }
+  }
+  if (has_error)
+    return StatusTuple(-1, error_msg);
+  else
+    return StatusTuple::OK();
+}
+
 StatusTuple BPF::detach_usdt_without_validation(const USDT& u, pid_t pid) {
   auto& probe = *static_cast<::USDT::Probe*>(u.probe_.get());
   bool failed = false;
@@ -610,7 +640,7 @@ StatusTuple BPF::detach_perf_event_raw(void* perf_event_attr) {
 }
 
 StatusTuple BPF::open_perf_event(const std::string& name, uint32_t type,
-                                 uint64_t config) {
+                                 uint64_t config, int pid) {
   if (perf_event_arrays_.find(name) == perf_event_arrays_.end()) {
     TableStorage::iterator it;
     if (!bpf_module_->table_storage().Find(Path({bpf_module_->id(), name}), it))
@@ -619,7 +649,7 @@ StatusTuple BPF::open_perf_event(const std::string& name, uint32_t type,
     perf_event_arrays_[name] = new BPFPerfEventArray(it->second);
   }
   auto table = perf_event_arrays_[name];
-  TRY2(table->open_all_cpu(type, config));
+  TRY2(table->open_all_cpu(type, config, pid));
   return StatusTuple::OK();
 }
 
@@ -750,6 +780,10 @@ std::string BPF::get_syscall_fnname(const std::string& name) {
       syscall_prefix_.reset(new std::string("sys_"));
     else if (ksym.resolve_name(nullptr, "__x64_sys_bpf", &addr))
       syscall_prefix_.reset(new std::string("__x64_sys_"));
+    else if (ksym.resolve_name(nullptr, "__arm64_sys_bpf", &addr))
+      syscall_prefix_.reset(new std::string("__arm64_sys_"));
+    else if (ksym.resolve_name(nullptr, "__riscv_sys_bpf", &addr))
+      syscall_prefix_.reset(new std::string("__riscv_sys_"));
     else
       syscall_prefix_.reset(new std::string());
   }
@@ -853,6 +887,17 @@ bool BPF::add_module(std::string module)
     false : true;
 }
 
+namespace {
+
+constexpr size_t kEventNameSizeLimit = 224;
+
+std::string shorten_event_name(const std::string& name) {
+  std::string hash = uint_to_hex(std::hash<std::string>{}(name));
+  return name.substr(0, kEventNameSizeLimit - hash.size()) + hash;
+}
+
+} // namespace
+
 std::string BPF::get_uprobe_event(const std::string& binary_path,
                                   uint64_t offset, bpf_probe_attach_type type,
                                   pid_t pid) {
@@ -861,6 +906,9 @@ std::string BPF::get_uprobe_event(const std::string& binary_path,
   res += "_0x" + uint_to_hex(offset);
   if (pid != -1)
     res += "_" + std::to_string(pid);
+  if (res.size() > kEventNameSizeLimit) {
+    return shorten_event_name(res);
+  }
   return res;
 }
 

@@ -89,7 +89,11 @@ static struct trace *get_trace(struct pt_regs *ctx, bool entry)
 		return NULL;
 
 	if (entry) {
-		ip = KSNOOP_IP_FIX(PT_REGS_IP_CORE(ctx));
+		if (bpf_core_enum_value_exists(enum bpf_func_id,
+					       BPF_FUNC_get_func_ip))
+			ip = bpf_get_func_ip(ctx);
+		else
+			ip = KSNOOP_IP_FIX(PT_REGS_IP_CORE(ctx));
 		if (stack_depth >= FUNC_MAX_STACK_DEPTH - 1)
 			return NULL;
 		/* verifier doesn't like using "stack_depth - 1" as array index
@@ -99,7 +103,8 @@ static struct trace *get_trace(struct pt_regs *ctx, bool entry)
 		/* get address of last function we called */
 		if (last_stack_depth >= 0 &&
 		    last_stack_depth < FUNC_MAX_STACK_DEPTH)
-			last_ip = func_stack->ips[last_stack_depth];
+			bpf_probe_read_kernel(&last_ip, sizeof(last_ip),
+					      &func_stack->ips[last_stack_depth]);
 		/* push ip onto stack. return will pop it. */
 		func_stack->ips[stack_depth] = ip;
 		/* mask used in case bounds checks are optimized out */
@@ -198,7 +203,7 @@ static struct trace *get_trace(struct pt_regs *ctx, bool entry)
 
 static void output_trace(struct pt_regs *ctx, struct trace *trace)
 {
-	__u16 trace_len;
+	__u64 trace_len;
 
 	if (trace->buf_len == 0)
 		goto skip;
@@ -442,13 +447,13 @@ static int ksnoop(struct pt_regs *ctx, bool entry)
 }
 
 SEC("kprobe/foo")
-int kprobe_entry(struct pt_regs *ctx)
+int BPF_KPROBE(kprobe_entry)
 {
 	return ksnoop(ctx, true);
 }
 
 SEC("kretprobe/foo")
-int kprobe_return(struct pt_regs *ctx)
+int BPF_KRETPROBE(kprobe_return)
 {
 	return ksnoop(ctx, false);
 }

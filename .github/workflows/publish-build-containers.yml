@@ -24,15 +24,13 @@ jobs:
     strategy:
       matrix:
         os: [
-          {distro: "ubuntu", version: "18.04", nick: bionic},
-          {distro: "ubuntu", version: "20.04", nick: focal},
-          {distro: "fedora", version: "34", nick: "f34"},
-          {distro: "fedora", version: "36", nick: "f36"}
+          {distro: "ubuntu", version: "24.04", nick: noble, installed_llvm_versions: "15 17 19"},
+          {distro: "fedora", version: "38", nick: "f38", installed_llvm_versions: "this is not used"},
         ]
 
     steps:
 
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v4
 
     - name: Build and push
       uses: ./.github/actions/build-container
@@ -40,5 +38,6 @@ jobs:
         os_distro: ${{ matrix.os.distro }}
         os_version: ${{ matrix.os.version }}
         os_nick: ${{ matrix.os.nick }}
+        llvm_versions: ${{ matrix.os.installed_llvm_versions }}
         password: ${{ secrets.GITHUB_TOKEN }}
         push: true

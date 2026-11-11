@@ -154,7 +154,10 @@ Sampling at 49 Hertz of PID 25036 by user + kernel stack... Hit Ctrl-C to end.
         7
 
 Again, I've truncated some lines. Now we're just analyzing the dd process.
-The filtering is performed in kernel context, for efficiency.
+The filter is configured by specifying the target PID (from the current PID
+namespace where we are profiling) via the "-p" flag.
+Filtering is performed in kernel context, for efficiency, with automatic
+PID translation to the top-level namespace (if required).
 
 This output has some "[unknown]" frames that probably have valid addresses,
 but we're lacking the symbol translation. This is a common for all profilers
@@ -585,8 +588,7 @@ Sampling at 9 Hertz of all threads by user + kernel stack... Hit Ctrl-C to end.
 [...]
 
 
-You can also restrict profiling to just kernel stacks (-K) or user stacks (-U).
-For example, just user stacks:
+You can specify a cpu number using the -C option. Eg, profiling core/cpu (#7):
 
 # ./profile -C 7 2
 Sampling at 49 Hertz of all threads by user + kernel stack on CPU#7 for 2 secs.
@@ -621,7 +623,11 @@ Sampling at 49 Hertz of all threads by user + kernel stack on CPU#7 for 2 secs.
     -                python (2827439)
 
 in this example python application was busylooping on a single core/cpu (#7)
-we were collecting stack traces only from it
+we were collecting stack traces only from it.
+
+
+You can also restrict profiling to just kernel stacks (-K) or user stacks (-U).
+For example, just user stacks:
 
 # ./profile -U
 Sampling at 49 Hertz of all threads by user stack... Hit Ctrl-C to end.
@@ -744,7 +750,7 @@ USAGE message:
 
 # ./profile -h
 usage: profile.py [-h] [-p PID | -L TID] [-U | -K] [-F FREQUENCY | -c COUNT]
-                  [-d] [-a] [-I] [-f]
+                  [-d] [-a] [-I] [-f] [--hash-storage-size HASH_STORAGE_SIZE]
                   [--stack-storage-size STACK_STORAGE_SIZE] [-C CPU]
                   [--cgroupmap CGROUPMAP] [--mntnsmap MNTNSMAP]
                   [duration]
@@ -756,8 +762,10 @@ positional arguments:
 
 optional arguments:
   -h, --help            show this help message and exit
-  -p PID, --pid PID     profile process with this PID only
-  -L TID, --tid TID     profile thread with this TID only
+  -p PID, --pid PID     profile process with one or more comma separated PIDs
+                        only
+  -L TID, --tid TID     profile thread with one or more comma separated TIDs
+                        only
   -U, --user-stacks-only
                         show stacks from user space only (no kernel space
                         stacks)
@@ -773,6 +781,9 @@ optional arguments:
   -I, --include-idle    include CPU idle stacks
   -f, --folded          output folded format, one line per stack (for flame
                         graphs)
+  --hash-storage-size HASH_STORAGE_SIZE
+                        the number of hash keys that can be stored and
+                        (default 40960)
   --stack-storage-size STACK_STORAGE_SIZE
                         the number of unique stack traces that can be stored
                         and displayed (default 16384)

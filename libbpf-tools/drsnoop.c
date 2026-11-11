@@ -42,15 +42,15 @@ const char argp_program_doc[] =
 "    drsnoop -p 123  # trace pid 123\n"
 "    drsnoop -t 123  # trace tid 123 (use for threads only)\n"
 "    drsnoop -d 10   # trace for 10 seconds only\n"
-"    drsnoop -e      # trace all direct reclaim events with extended faileds\n";
+"    drsnoop -e      # trace all direct reclaim events with extended fields\n";
 
 static const struct argp_option opts[] = {
-	{ "duration", 'd', "DURATION", 0, "Total duration of trace in seconds" },
-	{ "extended", 'e', NULL, 0, "Extended fields output" },
-	{ "pid", 'p', "PID", 0, "Process PID to trace" },
-	{ "tid", 't', "TID", 0, "Thread TID to trace" },
-	{ "verbose", 'v', NULL, 0, "Verbose debug output" },
-	{ NULL, 'h', NULL, OPTION_HIDDEN, "Show the full help" },
+	{ "duration", 'd', "DURATION", 0, "Total duration of trace in seconds", 0 },
+	{ "extended", 'e', NULL, 0, "Extended fields output", 0 },
+	{ "pid", 'p', "PID", 0, "Process PID to trace", 0 },
+	{ "tid", 't', "TID", 0, "Thread TID to trace", 0 },
+	{ "verbose", 'v', NULL, 0, "Verbose debug output", 0 },
+	{ NULL, 'h', NULL, OPTION_HIDDEN, "Show the full help", 0 },
 	{},
 };
 
@@ -118,19 +118,22 @@ static void sig_int(int signo)
 
 void handle_event(void *ctx, int cpu, void *data, __u32 data_sz)
 {
-	const struct event *e = data;
-	struct tm *tm;
+	struct event e;
 	char ts[32];
-	time_t t;
 
-	time(&t);
-	tm = localtime(&t);
-	strftime(ts, sizeof(ts), "%H:%M:%S", tm);
+	if (data_sz < sizeof(e)) {
+		printf("Error: packet too small\n");
+		return;
+	}
+	/* Copy data as alignment in the perf buffer isn't guaranteed. */
+	memcpy(&e, data, sizeof(e));
+
+	str_timestamp("%H:%M:%S", ts, sizeof(ts));
 	printf("%-8s %-16s %-6d %8.3f %5lld",
-	       ts, e->task, e->pid, e->delta_ns / 1000000.0,
-	       e->nr_reclaimed);
+	       ts, e.task, e.pid, e.delta_ns / 1000000.0,
+	       e.nr_reclaimed);
 	if (env.extended)
-		printf(" %8llu", e->nr_free_pages * page_size / 1024);
+		printf(" %8llu", e.nr_free_pages * page_size / 1024);
 	printf("\n");
 }
 
@@ -157,7 +160,6 @@ int main(int argc, char **argv)
 	if (err)
 		return err;
 
-	libbpf_set_strict_mode(LIBBPF_STRICT_ALL);
 	libbpf_set_print(libbpf_print_fn);
 
 	obj = drsnoop_bpf__open();
@@ -182,6 +184,14 @@ int main(int argc, char **argv)
 		}
 		obj->rodata->vm_zone_stat_kaddr = ksym->addr;
 		page_size = sysconf(_SC_PAGESIZE);
+	}
+
+	if (probe_tp_btf("mm_vmscan_direct_reclaim_begin")) {
+		bpf_program__set_autoload(obj->progs.direct_reclaim_begin, false);
+		bpf_program__set_autoload(obj->progs.direct_reclaim_end, false);
+	} else {
+		bpf_program__set_autoload(obj->progs.direct_reclaim_begin_btf, false);
+		bpf_program__set_autoload(obj->progs.direct_reclaim_end_btf, false);
 	}
 
 	err = drsnoop_bpf__load(obj);

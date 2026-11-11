@@ -57,13 +57,13 @@ const char argp_program_doc[] =
 "    exitsnoop -c CG       # Trace process under cgroupsPath CG\n";
 
 static const struct argp_option opts[] = {
-	{ "timestamp", 't', NULL, 0, "Include timestamp on output" },
-	{ "failed", 'x', NULL, 0, "Trace error exits only." },
-	{ "pid", 'p', "PID", 0, "Process ID to trace" },
-	{ "threaded", 'T', NULL, 0, "Trace by thread." },
-	{ "verbose", 'v', NULL, 0, "Verbose debug output" },
-	{ NULL, 'h', NULL, OPTION_HIDDEN, "Show the full help" },
-	{ "cgroup", 'c', "/sys/fs/cgroup/unified", 0, "Trace process in cgroup path"},
+	{ "timestamp", 't', NULL, 0, "Include timestamp on output", 0 },
+	{ "failed", 'x', NULL, 0, "Trace error exits only.", 0 },
+	{ "pid", 'p', "PID", 0, "Process ID to trace", 0 },
+	{ "threaded", 'T', NULL, 0, "Trace by thread.", 0 },
+	{ "verbose", 'v', NULL, 0, "Verbose debug output", 0 },
+	{ NULL, 'h', NULL, OPTION_HIDDEN, "Show the full help", 0 },
+	{ "cgroup", 'c', "/sys/fs/cgroup/unified", 0, "Trace process in cgroup path", 0 },
 	{},
 };
 
@@ -120,32 +120,35 @@ static void sig_int(int signo)
 
 static void handle_event(void *ctx, int cpu, void *data, __u32 data_sz)
 {
-	struct event *e = data;
-	time_t t;
-	struct tm *tm;
+	struct event e;
 	char ts[32];
 	double age;
 	int sig, coredump;
 
+	if (data_sz < sizeof(e)) {
+		printf("Error: packet too small\n");
+		return;
+	}
+	/* Copy data as alignment in the perf buffer isn't guaranteed. */
+	memcpy(&e, data, sizeof(e));
+
 	if (emit_timestamp) {
-		time(&t);
-		tm = localtime(&t);
-		strftime(ts, sizeof(ts), "%H:%M:%S", tm);
+		str_timestamp("%H:%M:%S", ts, sizeof(ts));
 		printf("%8s ", ts);
 	}
 
-	age = (e->exit_time - e->start_time) / 1e9;
+	age = (e.exit_time - e.start_time) / 1e9;
 	printf("%-16s %-7d %-7d %-7d %-7.2f ",
-	       e->comm, e->pid, e->ppid, e->tid, age);
+	       e.comm, e.pid, e.ppid, e.tid, age);
 
-	if (!e->sig) {
-		if (!e->exit_code)
+	if (!e.sig) {
+		if (!e.exit_code)
 			printf("0\n");
 		else
-			printf("code %d\n", e->exit_code);
+			printf("code %d\n", e.exit_code);
 	} else {
-		sig = e->sig & 0x7f;
-		coredump = e->sig & 0x80;
+		sig = e.sig & 0x7f;
+		coredump = e.sig & 0x80;
 		if (sig)
 			printf("signal %d (%s)", sig, strsignal(sig));
 		if (coredump)
@@ -177,7 +180,6 @@ int main(int argc, char **argv)
 	if (err)
 		return err;
 
-	libbpf_set_strict_mode(LIBBPF_STRICT_ALL);
 	libbpf_set_print(libbpf_print_fn);
 
 	err = ensure_core_btf(&open_opts);

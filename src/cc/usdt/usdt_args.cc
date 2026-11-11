@@ -58,7 +58,8 @@ bool Argument::get_global_address(uint64_t *address, const std::string &binpath,
         .resolve_name(binpath.c_str(), deref_ident_->c_str(), address);
   }
 
-  if (!bcc_elf_is_shared_obj(binpath.c_str())) {
+  if (!bcc_elf_is_shared_obj(binpath.c_str()) ||
+      bcc_elf_is_pie(binpath.c_str())) {
     struct bcc_symbol sym;
     if (bcc_resolve_symname(binpath.c_str(), deref_ident_->c_str(), 0x0, -1, nullptr, &sym) == 0) {
       *address = sym.offset;
@@ -211,6 +212,8 @@ bool ArgumentParser_aarch64::parse_mem(ssize_t pos, ssize_t &new_pos,
       dest->scale_ = 1;
       dest->deref_offset_ = 0;
     }
+  } else if (arg_[new_pos] == ']') {
+    dest->deref_offset_ = 0;
   }
   if (arg_[new_pos] != ']')
     return error_return(new_pos, new_pos);
@@ -481,6 +484,56 @@ bool ArgumentParser_s390x::parse(Argument *dest) {
       }
     } else {
       matched = false;
+    }
+  }
+
+  if (!matched) {
+    print_error(cur_pos_);
+    skip_until_whitespace_from(cur_pos_);
+    skip_whitespace_from(cur_pos_);
+    return false;
+  }
+
+  cur_pos_ += matches.length(0);
+  skip_whitespace_from(cur_pos_);
+  return true;
+}
+
+
+
+bool ArgumentParser_riscv64::parse(Argument *dest) {
+  if (done())
+    return false;
+
+  bool matched;
+  std::smatch matches;
+  std::string arg_str(&arg_[cur_pos_]);
+  std::regex arg_n_regex("^(\\-?[1248])\\@");
+  // Operands with constants of form NUM
+  std::regex arg_op_regex_const("^(\\-?[0-9]+)( +|$)");
+  std::string reg_str =
+        "((a[0-9])|((s[0-9p])|s1[0-1])|(t[0-6p])|(pc)|(ra)|(fp)|(gp))";
+  // Operands with register only of form REG
+  std::regex arg_op_regex_reg("^" + reg_str + "( +|$)");
+  // Operands with a base register and an offset of form NUM(REG) or -NUM(REG)
+  std::regex arg_op_regex_breg_off("^(\\-?[0-9]+)\\(" + reg_str + "\\)( +|$)");
+
+  matched = std::regex_search(arg_str, matches, arg_n_regex);
+  if (matched) {
+    dest->arg_size_ = stoi(matches.str(1));
+    cur_pos_ += matches.length(0);
+    arg_str = &arg_[cur_pos_];
+    std::string reg_name;
+
+    if (std::regex_search(arg_str, matches, arg_op_regex_const)) {
+      dest->constant_ = (long long)stoull(matches.str(1));
+    } else if (std::regex_search(arg_str, matches, arg_op_regex_reg)) {
+      dest->base_register_name_ = matches.str(1);
+    } else if (std::regex_search(arg_str, matches, arg_op_regex_breg_off)) {
+      dest->deref_offset_ = stoi(matches.str(1));
+      dest->base_register_name_ = matches.str(2);
+    } else {
+        matched = false;
     }
   }
 

@@ -43,6 +43,7 @@ class Probe(object):
         build_id_enabled = False
         aggregate = False
         symcount = {}
+        done = False
 
         @classmethod
         def configure(cls, args):
@@ -591,6 +592,8 @@ BPF_PERF_OUTPUT(%s);
                     print("%s-->COUNT %d\n\n" % (k, v), end="")
 
         def print_event(self, bpf, cpu, data, size):
+                if Probe.done:
+                       return
                 event = bpf[self.events_name].event(data)
                 if self.name not in event.comm:
                     return
@@ -635,7 +638,7 @@ BPF_PERF_OUTPUT(%s);
                     if self.aggregate:
                         self.print_aggregate_events()
                     sys.stdout.flush()
-                    exit()
+                    Probe.done = True;
 
         def attach(self, bpf, verbose):
                 if len(self.library) == 0:
@@ -895,7 +898,7 @@ trace -s /lib/x86_64-linux-gnu/libc.so.6,/bin/ping 'p:c:inet_pton' -U
                       "-" if not all_probes_trivial else ""))
                 sys.stdout.flush()
 
-                while True:
+                while not Probe.done:
                         self.bpf.perf_buffer_poll()
 
         def run(self):

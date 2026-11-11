@@ -14,10 +14,11 @@ struct {
 } events SEC(".maps");
 
 SEC("uretprobe/readline")
-int BPF_KRETPROBE(printret, const void *ret) {
-	struct str_t data;
+int BPF_URETPROBE(printret, const void *ret) {
+	struct str_t data = {};
 	char comm[TASK_COMM_LEN];
 	u32 pid;
+	int err_ret;
 
 	if (!ret)
 		return 0;
@@ -28,7 +29,9 @@ int BPF_KRETPROBE(printret, const void *ret) {
 
 	pid = bpf_get_current_pid_tgid() >> 32;
 	data.pid = pid;
-	bpf_probe_read_user_str(&data.str, sizeof(data.str), ret);
+	err_ret = bpf_probe_read_user_str(&data.str, sizeof(data.str), ret);
+	if (err_ret < 0)
+		return 0;
 
 	bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &data, sizeof(data));
 

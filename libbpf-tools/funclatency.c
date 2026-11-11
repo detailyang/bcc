@@ -38,8 +38,10 @@ static struct prog_env {
 	bool timestamp;
 	char *funcname;
 	bool verbose;
+	bool kprobes;
 	char *cgroupspath;
 	bool cg;
+	bool is_kernel_func;
 } env = {
 	.interval = 99999999,
 	.iterations = 99999999,
@@ -72,17 +74,18 @@ static const char program_doc[] =
 ;
 
 static const struct argp_option opts[] = {
-	{ "milliseconds", 'm', NULL, 0, "Output in milliseconds"},
-	{ "microseconds", 'u', NULL, 0, "Output in microseconds"},
-	{0, 0, 0, 0, ""},
-	{ "pid", 'p', "PID", 0, "Process ID to trace"},
-	{0, 0, 0, 0, ""},
-	{ "interval", 'i', "INTERVAL", 0, "Summary interval in seconds"},
-	{ "cgroup", 'c', "/sys/fs/cgroup/unified", 0, "Trace process in cgroup path" },
-	{ "duration", 'd', "DURATION", 0, "Duration to trace"},
-	{ "timestamp", 'T', NULL, 0, "Print timestamp"},
-	{ "verbose", 'v', NULL, 0, "Verbose debug output" },
-	{ NULL, 'h', NULL, OPTION_HIDDEN, "Show the full help"},
+	{ "milliseconds", 'm', NULL, 0, "Output in milliseconds", 0 },
+	{ "microseconds", 'u', NULL, 0, "Output in microseconds", 0 },
+	{0, 0, 0, 0, "", 0 },
+	{ "pid", 'p', "PID", 0, "Process ID to trace", 0 },
+	{0, 0, 0, 0, "", 0 },
+	{ "interval", 'i', "INTERVAL", 0, "Summary interval in seconds", 0 },
+	{ "cgroup", 'c', "/sys/fs/cgroup/unified", 0, "Trace process in cgroup path", 0 },
+	{ "duration", 'd', "DURATION", 0, "Duration to trace", 0 },
+	{ "timestamp", 'T', NULL, 0, "Print timestamp", 0 },
+	{ "verbose", 'v', NULL, 0, "Verbose debug output", 0 },
+	{ "kprobes", 'k', NULL, 0, "Use kprobes instead of fentry", 0 },
+	{ NULL, 'h', NULL, OPTION_HIDDEN, "Show the full help", 0 },
 	{},
 };
 
@@ -140,6 +143,9 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 	case 'T':
 		env->timestamp = true;
 		break;
+	case 'k':
+		env->kprobes = true;
+		break;
 	case 'v':
 		env->verbose = true;
 		break;
@@ -191,23 +197,56 @@ static const char *unit_str(void)
 	return "bad units";
 }
 
-static int attach_kprobes(struct funclatency_bpf *obj)
+static bool try_fentry(struct funclatency_bpf *obj)
 {
 	long err;
 
-	obj->links.dummy_kprobe = bpf_program__attach_kprobe(obj->progs.dummy_kprobe, false,
-							     env.funcname);
+	if (env.kprobes || !env.is_kernel_func ||
+	    !fentry_can_attach(env.funcname, NULL)) {
+		goto out_no_fentry;
+	}
+
+	err = bpf_program__set_attach_target(obj->progs.dummy_fentry, 0,
+					     env.funcname);
+	if (err) {
+		warn("failed to set attach fentry: %s\n", strerror(-err));
+		goto out_no_fentry;
+	}
+
+	err = bpf_program__set_attach_target(obj->progs.dummy_fexit, 0,
+					     env.funcname);
+	if (err) {
+		warn("failed to set attach fexit: %s\n", strerror(-err));
+		goto out_no_fentry;
+	}
+
+	bpf_program__set_autoload(obj->progs.dummy_kprobe, false);
+	bpf_program__set_autoload(obj->progs.dummy_kretprobe, false);
+
+	return true;
+
+out_no_fentry:
+	bpf_program__set_autoload(obj->progs.dummy_fentry, false);
+	bpf_program__set_autoload(obj->progs.dummy_fexit, false);
+
+	return false;
+}
+
+static int attach_kprobes(struct funclatency_bpf *obj)
+{
+	obj->links.dummy_kprobe =
+		bpf_program__attach_kprobe(obj->progs.dummy_kprobe, false,
+					   env.funcname);
 	if (!obj->links.dummy_kprobe) {
-		err = -errno;
-		warn("failed to attach kprobe: %ld\n", err);
+		warn("failed to attach kprobe: %d\n", -errno);
 		return -1;
 	}
 
-	obj->links.dummy_kretprobe = bpf_program__attach_kprobe(obj->progs.dummy_kretprobe, true,
-								env.funcname);
+	obj->links.dummy_kretprobe =
+		bpf_program__attach_kprobe(obj->progs.dummy_kretprobe, true,
+					   env.funcname);
 	if (!obj->links.dummy_kretprobe) {
-		err = -errno;
-		warn("failed to attach kretprobe: %ld\n", err);
+		warn("failed to attach kretprobe: %d\n", -errno);
 		return -1;
 	}
 
@@ -270,13 +309,6 @@ out_binary:
 	return ret;
 }
 
-static int attach_probes(struct funclatency_bpf *obj)
-{
-	if (strchr(env.funcname, ':'))
-		return attach_uprobes(obj);
-	return attach_kprobes(obj);
-}
-
 static volatile bool exiting;
 
 static void sig_hand(int signr)
@@ -297,19 +329,19 @@ int main(int argc, char **argv)
 	};
 	struct funclatency_bpf *obj;
 	int i, err;
-	struct tm *tm;
 	char ts[32];
-	time_t t;
 	int idx, cg_map_fd;
 	int cgfd = -1;
+	bool used_fentry = false;
 
 	err = argp_parse(&argp, argc, argv, 0, NULL, &env);
 	if (err)
 		return err;
 
+	env.is_kernel_func = !strchr(env.funcname, ':');
+
 	sigaction(SIGINT, &sigact, 0);
 
-	libbpf_set_strict_mode(LIBBPF_STRICT_ALL);
 	libbpf_set_print(libbpf_print_fn);
 
 	err = ensure_core_btf(&open_opts);
@@ -327,6 +359,8 @@ int main(int argc, char **argv)
 	obj->rodata->units = env.units;
 	obj->rodata->targ_tgid = env.pid;
 	obj->rodata->filter_cg = env.cg;
+
+	used_fentry = try_fentry(obj);
 
 	err = funclatency_bpf__load(obj);
 	if (err) {
@@ -354,9 +388,21 @@ int main(int argc, char **argv)
 		goto cleanup;
 	}
 
-	err = attach_probes(obj);
-	if (err)
+	if (!used_fentry) {
+		if (env.is_kernel_func)
+			err = attach_kprobes(obj);
+		else
+			err = attach_uprobes(obj);
+		if (err)
+			goto cleanup;
+	}
+
+	err = funclatency_bpf__attach(obj);
+	if (err) {
+		fprintf(stderr, "failed to attach BPF programs: %s\n",
+			strerror(-err));
 		goto cleanup;
+	}
 
 	printf("Tracing %s.  Hit Ctrl-C to exit\n", env.funcname);
 
@@ -365,13 +411,14 @@ int main(int argc, char **argv)
 
 		printf("\n");
 		if (env.timestamp) {
-			time(&t);
-			tm = localtime(&t);
-			strftime(ts, sizeof(ts), "%H:%M:%S", tm);
+			str_timestamp("%H:%M:%S", ts, sizeof(ts));
 			printf("%-8s\n", ts);
 		}
 
 		print_log2_hist(obj->bss->hist, MAX_SLOTS, unit_str());
+
+		/* Cleanup histograms for interval output */
+		memset(obj->bss->hist, 0, sizeof(obj->bss->hist));
 	}
 
 	printf("Exiting trace of %s\n", env.funcname);
